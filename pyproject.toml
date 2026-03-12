@@ -21,6 +21,14 @@ license = {text = "MIT"}
 dependencies = [
   "typer",
   "rich",
+  "zarr>=2.18,<3",
+  "dask[array,dataframe]>=2024.1",
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "pyarrow>=14.0",
+  "tifffile>=2024.1",
+  "geopandas>=1.0",
+  "shapely>=2.0",
 ]
 requires-python = ">= 3.12"
 
