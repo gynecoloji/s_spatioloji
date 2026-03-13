@@ -26,15 +26,16 @@ Typical usage::
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
+
+import dask.dataframe as dd
 
 from s_spatioloji.data.boundaries import BoundaryStore
 from s_spatioloji.data.cells import CellStore
 from s_spatioloji.data.config import SpatiolojiConfig
 from s_spatioloji.data.expression import ExpressionStore
 from s_spatioloji.data.images import MorphologyImageStore
-
 
 # ---------------------------------------------------------------------------
 # TileView — a spatially scoped sub-object
@@ -112,6 +113,147 @@ class TileView:
             f"x=[{self.x_min}, {self.x_max}], "
             f"y=[{self.y_min}, {self.y_max}])"
         )
+
+
+# ---------------------------------------------------------------------------
+# Maps accessor
+# ---------------------------------------------------------------------------
+
+
+class Maps:
+    """Accessor for computed results stored in the ``maps/`` directory.
+
+    Provides dict-like access to Parquet and Zarr results written by
+    compute functions.  Keys are bare names (no file extension).
+
+    Args:
+        sj: The parent ``s_spatioloji`` instance.
+
+    Example:
+        >>> sj.maps["X_pca"]           # → dask.dataframe
+        >>> sj.maps["expression_scvi"] # → ExpressionStore
+        >>> sj.maps.keys()             # → list of available keys
+        >>> sj.maps.has("X_umap")      # → bool
+    """
+
+    def __init__(self, sj: s_spatioloji) -> None:
+        self._sj = sj
+
+    def _maps_dir(self) -> Path:
+        """Return the ``maps/`` directory path (may not exist yet)."""
+        return self._sj.config.root / "maps"
+
+    def __getitem__(self, key: str) -> dd.DataFrame | ExpressionStore:
+        """Look up a result by bare key name.
+
+        Args:
+            key: Bare key name (e.g. ``"X_pca"``, ``"expression_scvi"``).
+
+        Returns:
+            ``dask.dataframe.DataFrame`` for Parquet results, or
+            :class:`ExpressionStore` for Zarr results.
+
+        Raises:
+            KeyError: If no result exists for ``key``.
+            KeyError: If ``key`` is ``"_scvi_model"`` (internal directory).
+        """
+        if key == "_scvi_model":
+            raise KeyError("_scvi_model is an internal directory, not a user-accessible key")
+
+        maps_dir = self._maps_dir()
+
+        # 1. maps/<key>.parquet
+        parquet_path = maps_dir / f"{key}.parquet"
+        if parquet_path.exists():
+            return dd.read_parquet(str(parquet_path), engine="pyarrow")
+
+        # 2. maps/<key>.zarr/
+        zarr_maps = maps_dir / f"{key}.zarr"
+        if zarr_maps.exists() and zarr_maps.is_dir():
+            return ExpressionStore.open(zarr_maps, self._sj.config.chunks)
+
+        # 3. <root>/<key>.zarr/
+        zarr_root = self._sj.config.root / f"{key}.zarr"
+        if zarr_root.exists() and zarr_root.is_dir():
+            return ExpressionStore.open(zarr_root, self._sj.config.chunks)
+
+        raise KeyError(f"No result found for key {key!r}")
+
+    def has(self, key: str) -> bool:
+        """Return ``True`` if a result exists for ``key``.
+
+        Args:
+            key: Bare key name.
+
+        Returns:
+            ``True`` if the key resolves to an existing file.
+        """
+        try:
+            self[key]
+            return True
+        except KeyError:
+            return False
+
+    def keys(self) -> list[str]:
+        """Return all discoverable bare key names.
+
+        Scans ``maps/*.parquet``, ``maps/*.zarr/``, and
+        ``<root>/expression_*.zarr/`` and returns deduplicated names.
+
+        Returns:
+            Sorted list of bare key names.
+        """
+        result: list[str] = []
+        maps_dir = self._maps_dir()
+
+        if maps_dir.exists():
+            for p in sorted(maps_dir.iterdir()):
+                if p.suffix == ".parquet" and p.is_file():
+                    result.append(p.stem)
+                elif p.suffix == ".zarr" and p.is_dir() and p.stem != "_scvi_model":
+                    result.append(p.stem)
+
+        for p in sorted(self._sj.config.root.iterdir()):
+            if p.name.startswith("expression_") and p.suffix == ".zarr" and p.is_dir():
+                result.append(p.stem)
+
+        return list(dict.fromkeys(result))
+
+    def delete(self, key: str) -> None:
+        """Delete a result from disk.
+
+        Follows the same lookup order as ``__getitem__`` and removes only
+        the first match.
+
+        Args:
+            key: Bare key name.
+
+        Raises:
+            KeyError: If no result exists for ``key``.
+        """
+        import shutil
+
+        maps_dir = self._maps_dir()
+
+        parquet_path = maps_dir / f"{key}.parquet"
+        if parquet_path.exists():
+            parquet_path.unlink()
+            return
+
+        zarr_maps = maps_dir / f"{key}.zarr"
+        if zarr_maps.exists() and zarr_maps.is_dir():
+            shutil.rmtree(zarr_maps)
+            return
+
+        zarr_root = self._sj.config.root / f"{key}.zarr"
+        if zarr_root.exists() and zarr_root.is_dir():
+            shutil.rmtree(zarr_root)
+            return
+
+        raise KeyError(f"No result found for key {key!r}")
+
+    def __repr__(self) -> str:
+        return f"Maps(keys={self.keys()})"
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +358,23 @@ class s_spatioloji:
         (root / "_index").mkdir()
         cfg = config or SpatiolojiConfig(root=root)
         return cls(config=cfg)
+
+    # ------------------------------------------------------------------
+    # Maps accessor
+    # ------------------------------------------------------------------
+
+    @property
+    def maps(self) -> Maps:
+        """Accessor for computed results in the ``maps/`` directory.
+
+        Returns:
+            A :class:`Maps` instance for looking up results by key.
+
+        Example:
+            >>> sj.maps["X_pca"]
+            >>> sj.maps.keys()
+        """
+        return Maps(self)
 
     # ------------------------------------------------------------------
     # Lazy backend properties
