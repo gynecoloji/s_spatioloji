@@ -68,7 +68,8 @@ def build_knn_graph(
 - Reads cell centroids from `sj.cells` (x, y columns).
 - Uses `scipy.spatial.cKDTree` for efficient KNN query — O(N log N).
 - Writes edge list Parquet to `maps/knn_graph.parquet` with columns: `cell_id_a`, `cell_id_b`, `distance` (Euclidean).
-- Edge convention: `cell_id_a < cell_id_b` lexicographically. Duplicate edges from mutual KNN collapsed to single edge.
+- Edge convention: `cell_id_a < cell_id_b` lexicographically. Duplicate edges from mutual KNN collapsed to single edge (Euclidean distances are symmetric, so distance is identical regardless of direction).
+- Zero-distance handling: if two cells share identical coordinates (`distance == 0.0`), the edge is kept but distance is clamped to `epsilon = 1e-10` to prevent division-by-zero in downstream inverse-distance computations.
 - Returns `output_key`.
 
 #### `build_radius_graph`
@@ -102,12 +103,15 @@ def _load_point_graph(sj: s_spatioloji, graph_key: str = "knn_graph") -> nx.Grap
 
 ```python
 def _load_point_graph_sparse(
-    sj: s_spatioloji, graph_key: str = "knn_graph"
+    sj: s_spatioloji,
+    graph_key: str = "knn_graph",
+    weighted: bool = False,
 ) -> tuple[scipy.sparse.csr_matrix, np.ndarray]:
 ```
 
 - Loads edge list from `maps/<graph_key>.parquet`.
-- Returns `(adjacency_matrix, cell_ids)` where `adjacency_matrix` is a symmetric binary `csr_matrix` and `cell_ids` is a 1D array mapping matrix indices to cell_id strings.
+- When `weighted=False`: returns `(adjacency_matrix, cell_ids)` where `adjacency_matrix` is a symmetric binary `csr_matrix` (0/1 entries) and `cell_ids` is a 1D array mapping matrix indices to cell_id strings.
+- When `weighted=True`: returns a symmetric `csr_matrix` with `1 / max(distance, 1e-10)` as edge weights (inverse-distance). The `1e-10` floor prevents infinity from coincident points.
 - Raises `FileNotFoundError` if not found.
 - **Primary loader** for scalable operations (Moran's I, Geary's C, neighborhoods, etc.).
 
@@ -131,7 +135,7 @@ def neighborhood_composition(
 - Loads graph via `_load_point_graph_sparse`.
 - Loads cluster labels from `sj.maps[cluster_key]`.
 - When `weighted=False`: sparse matrix multiplication `adjacency @ cluster_indicator_matrix` gives counts per cluster per cell in one operation.
-- When `weighted=True`: uses inverse-distance weighted adjacency matrix (`1/distance` weights) instead of binary. Closer neighbors contribute more.
+- When `weighted=True`: calls `_load_point_graph_sparse(weighted=True)` to get inverse-distance adjacency matrix. Closer neighbors contribute more.
 - Writes `maps/pt_nhood_composition.parquet`: `cell_id`, one column per cluster label.
 - Raises `FileNotFoundError` if graph not built.
 
@@ -147,8 +151,8 @@ def nth_order_neighbors(
 ) -> str:
 ```
 
-- BFS up to `order` hops on graph. Excludes the cell itself. Counts at each order are exclusive (order 2 excludes order 1 neighbors).
-- Uses `_load_point_graph` (networkx) — BFS requires graph traversal.
+- Computes nth-order neighbor counts up to `order` hops. Excludes the cell itself. Counts at each order are exclusive (order 2 excludes order 1 neighbors).
+- Uses sparse matrix powers via `_load_point_graph_sparse`: `A^k` gives reachability at order k. Exclusive count at order k = `(A^k > 0).sum(axis=1) - (A^{k-1} > 0).sum(axis=1)` (subtracting cells reachable at lower orders). Computed incrementally: `A_k = A_{k-1} @ A`, binarize at each step.
 - Writes `maps/pt_nhood_nth_order.parquet`: `cell_id`, columns `n_order_1` through `n_order_{order}`.
 
 #### `neighborhood_diversity`
@@ -205,7 +209,7 @@ def morans_i(
 - Spatial autocorrelation on a numeric feature. If `feature_key` points to a categorical column (detected by dtype object/category), computes one-hot indicators and returns one row per category.
 - Uses **binary** adjacency from `_load_point_graph_sparse` (0/1, ignoring distance).
 - Moran's I formula: `I = (N / W) * (sum_ij w_ij (x_i - x_bar)(x_j - x_bar)) / (sum_i (x_i - x_bar)^2)`. Computed as sparse matrix-vector multiplication: `z.T @ W @ z / (z.T @ z)` scaled by `N/W`, where `z = x - x_bar`.
-- `expected_I = -1 / (N - 1)`. Z-score uses randomization assumption variance. P-value two-sided from normal approximation.
+- `expected_I = -1 / (N - 1)`. Z-score uses **randomization assumption** variance: `Var(I) = (N * (S1*(N^2-3N+3) - N*S2 + 3*W^2) - k*(S1*(N^2-N) - 2*N*S2 + 6*W^2)) / ((N-1)*(N-2)*(N-3)*W^2) - expected_I^2` where `S1 = 0.5 * sum_ij (w_ij + w_ji)^2`, `S2 = sum_i (sum_j w_ij + sum_j w_ji)^2`, `k = (N * sum_i z_i^4) / (sum_i z_i^2)^2` (kurtosis). For binary symmetric weights: `S1 = 2 * nnz(W)`, `S2 = sum_i (2 * degree_i)^2`. Computed from sparse matrix: `S1 = 2 * W.nnz`, `S2 = ((W @ ones + W.T @ ones) ** 2).sum()`. P-value two-sided from normal approximation.
 - Writes `maps/pt_morans_i.parquet`: `feature`, `I`, `expected_I`, `z_score`, `p_value`.
 
 #### `gearys_c`
@@ -222,7 +226,7 @@ def gearys_c(
 
 - Same interface and categorical handling as `morans_i`. Uses binary adjacency.
 - Geary's C formula: `C = ((N-1) / (2*W)) * (sum_ij w_ij (x_i - x_j)^2) / (sum_i (x_i - x_bar)^2)`. Vectorized via sparse operations: for each edge, compute `(x_i - x_j)^2` using edge list arrays.
-- `expected_C = 1.0`. Z-score uses randomization assumption variance. P-value two-sided from normal approximation.
+- `expected_C = 1.0`. Z-score uses **randomization assumption** variance (same S1, S2, k terms as Moran's I): `Var(C) = ((2*S1 + S2)*(N-1) - 4*W^2) / (2*(N+1)*W^2)` for the normal approximation, adjusted by kurtosis: `Var(C) = ((N-1)*S1*(N^2 - 3*N + 3 - (N-1)*k) / (N*(N-2)*(N-3)*W^2)) - ((N-1)*S2*(N^2 + 3*N - 6 - (N^2 - N + 2)*k) / (4*N*(N-2)*(N-3)*W^2)) + ((N^2 - 3 - k*(N-1)^2) / ((N-2)*(N-3)))`. P-value two-sided from normal approximation.
 - Writes `maps/pt_gearys_c.parquet`: `feature`, `C`, `expected_C`, `z_score`, `p_value`.
 
 #### `clustering_coefficient`
@@ -238,6 +242,7 @@ def clustering_coefficient(
 
 - Per-cell local clustering coefficient from networkx.
 - Uses `_load_point_graph` (networkx required for this algorithm).
+- **Scalability guard:** If `sj.n_cells > 5_000_000`, raises `ValueError` with message "clustering_coefficient requires networkx and is not scalable beyond ~5M cells. Consider using morans_i or getis_ord_gi for large datasets." This threshold reflects the ~40 GB RAM needed for networkx at this scale.
 - Writes `maps/pt_clustering_coeff.parquet`: `cell_id`, `clustering_coeff`.
 
 #### `getis_ord_gi`
@@ -257,9 +262,9 @@ def getis_ord_gi(
 - `feature_key` is required (no default) — must point to a numeric maps key.
 - If `feature_key` points to a categorical column, raises `ValueError` ("Getis-Ord Gi* requires a numeric feature.").
 - Gi* formula: `Gi*(i) = (sum_j w_ij * x_j - x_bar * sum_j w_ij) / (S * sqrt((N * sum_j w_ij^2 - (sum_j w_ij)^2) / (N-1)))` where `S` is global std, `x_bar` is global mean, and `w_ij` includes `j=i` for star variant.
-- `star=True`: includes the cell itself in the local sum (Gi*). `star=False`: excludes it (Gi).
+- `star=True`: includes the cell itself in the local sum (Gi*). Implementation: set the adjacency matrix diagonal to 1 before computing so `w_ii = 1`. With binary weights, `sum_j w_ij^2 = sum_j w_ij = degree_i` (or `degree_i + 1` for star). `star=False`: excludes it (Gi), diagonal remains 0.
 - Z-scores are the statistic itself. P-value two-sided from normal approximation.
-- Fully vectorized via sparse matrix operations from `_load_point_graph_sparse`.
+- Fully vectorized via sparse matrix operations from `_load_point_graph_sparse(weighted=False)`.
 - Writes `maps/pt_getis_ord.parquet`: `cell_id`, `gi_stat`, `p_value`.
 
 ---
@@ -290,8 +295,8 @@ def ripley_k(
 ) -> str:
 ```
 
-- `K(r) = (A / N^2) * sum_i sum_{j!=i} w_ij * 1(d_ij <= r)` where `A` is study area, `N` is point count, `w_ij` is edge correction weight.
-- Uses `cKDTree.count_neighbors(other, r)` for O(N log N) pair counting per radius.
+- `K(r) = (A / (N*(N-1))) * sum_i sum_{j!=i} w_ij * 1(d_ij <= r)` where `A` is study area, `N` is point count, `w_ij` is edge correction weight. Uses the unbiased `N*(N-1)` estimator.
+- Uses `cKDTree.count_neighbors(other, r)` for O(N log N) pair counting per radius. Note: `count_neighbors` includes self-pairs (`i==j`); subtract N from the result since the formula excludes `j == i`.
 - Writes `maps/pt_ripley_k.parquet`: `cluster` (or `"all"`), `r`, `K`, `K_theo` (CSR expectation: `pi * r^2`).
 
 #### `ripley_l`
@@ -327,7 +332,7 @@ def ripley_g(
 ```
 
 - Nearest-neighbor distance function. `G(r) = fraction of points whose NN distance <= r`.
-- Computed from `cKDTree.query(k=2)` (k=2 because k=1 is self).
+- Computed by querying the point set against itself with `cKDTree.query(k=2)`. k=2 because k=1 returns self (distance=0); the k=2 result gives the true nearest-neighbor distance.
 - Writes `maps/pt_ripley_g.parquet`: `cluster`, `r`, `G`, `G_theo` (CSR: `1 - exp(-lambda * pi * r^2)` where `lambda = N/A`).
 
 #### `ripley_f`
@@ -369,8 +374,9 @@ def permutation_test(
 ) -> str:
 ```
 
-- Permutes cluster labels using `np.random.default_rng(random_state)`, recomputes colocalization ratios each time.
+- Permutes cluster labels using `np.random.default_rng(random_state)`, recomputes colocalization `observed/expected` ratios each time.
 - Uses `_load_point_graph_sparse` for O(N*k) per permutation.
+- `observed_ratio` is the `observed / expected` ratio from the real (unpermuted) data. `p_value` is the fraction of permutations with ratio >= observed ratio. `z_score = (observed_ratio - mean_null) / std_null`.
 - Writes `maps/pt_permutation_test.parquet`: `cluster_a`, `cluster_b`, `observed_ratio`, `p_value`, `z_score`.
 
 #### `quadrat_density`
@@ -429,7 +435,7 @@ def dclf_envelope(
 - `function`: one of `"K"`, `"L"`, `"G"`, `"F"` — which Ripley function to test against CSR.
 - Generates `n_simulations` CSR point patterns (uniform random in bounding box, same N), computes the chosen Ripley function for each.
 - Builds pointwise min/max envelope. Global envelope test p-value (DCLF: rank of observed max absolute deviation among simulation max absolute deviations).
-- `max_cells`: subsampling threshold. If N > `max_cells`, randomly samples `max_cells` cells before computing. Ripley's functions are statistical summaries that converge well under subsampling.
+- `max_cells`: subsampling threshold. If N > `max_cells`, randomly samples `max_cells` cells before computing. Simulations generate `max_cells` random points (matching the subsampled count, not the original N) to ensure comparability. Ripley's functions are statistical summaries that converge well under subsampling.
 - Uses `cKDTree.count_neighbors` for K/L simulations, `cKDTree.query` for G/F — all O(N log N) per simulation.
 - Writes `maps/pt_dclf_envelope.parquet`: `cluster`, `r`, `observed`, `lo` (envelope lower), `hi` (envelope upper), `theo` (CSR expectation), `p_value` (one global p-value repeated per row for convenience).
 
@@ -447,6 +453,9 @@ def dclf_envelope(
 8. **`max_cells` subsampling in `dclf_envelope`** — Monte Carlo simulations at 100M cells are prohibitive; subsampling is statistically valid for summary functions.
 9. **All functions use `force` parameter** — consistent with compute layer skip-if-exists pattern.
 10. **Core dependencies only** — scipy, networkx, numpy are all core deps. No optional dependency guards needed.
+11. **Sparse matrix approach for neighborhoods** — intentional departure from polygon module's networkx-based per-cell iteration, justified by the 50–100M cell scalability requirement. Uses `adjacency @ cluster_indicator_matrix` for O(N*k) vectorized computation.
+12. **Function signatures intentionally differ from polygon** — point module adds `weighted` parameter on neighborhoods and `star` on Getis-Ord, reflecting the continuous nature of distance vs binary polygon contact. The `pt_` prefix and different `graph_key` defaults already distinguish the two modules.
+13. **`__init__.py` exports** — `__all__` includes only public functions (those without `_` prefix). Private helpers (`_load_point_graph`, `_load_point_graph_sparse`) are imported directly by other point submodules.
 
 ## Scalability Notes
 
@@ -458,7 +467,8 @@ At 50–100M cells:
 - **Ripley's:** `cKDTree.count_neighbors` is O(N log N) per radius. Edge correction vectorized.
 - **DCLF:** Subsampled to `max_cells` (default 100K). 199 simulations × O(100K log 100K) is fast.
 - **Permutation test:** O(N*k) per permutation via sparse matrix. 1000 permutations at 100M cells is feasible.
-- **nth_order / clustering_coefficient:** These require networkx (graph algorithms). At 100M cells, networkx graph construction will be slow and memory-heavy. Consider warning or chunking for very large datasets.
+- **nth_order:** Uses sparse matrix powers (`A^k`) instead of networkx BFS. O(N*k^2) per order via repeated sparse matrix multiplication. Scales to 100M cells.
+- **clustering_coefficient:** Requires networkx — hard cell count guard at 5M cells with informative error message. Not scalable beyond this threshold.
 
 ## Testing Strategy
 
