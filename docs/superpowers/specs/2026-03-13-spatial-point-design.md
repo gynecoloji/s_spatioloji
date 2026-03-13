@@ -22,7 +22,7 @@ The KNN graph is the foundational data structure — built once, persisted as an
 - Sparse matrices (`scipy.sparse.csr_matrix`) over networkx wherever possible.
 - Tree-based counting (`scipy.spatial.cKDTree`) for Ripley's and distance-based statistics.
 - Vectorized numpy/scipy throughout — zero Python for-loops over cells.
-- Networkx used only where graph algorithms are required (BFS for nth_order, clustering coefficient).
+- Networkx used only where graph algorithms are required (clustering coefficient).
 - Subsampling parameter for inherently O(N^2) operations (Ripley's simulations).
 
 **Dependency flow:**
