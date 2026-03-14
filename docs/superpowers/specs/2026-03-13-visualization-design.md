@@ -19,12 +19,14 @@ All visualization functions follow a hybrid convention:
 - Optional `save_path: Path | str | None` to override save location.
 - `save: bool = True` controls auto-save behavior.
 
-**Figure saving:** All functions call `_save_figure()` from `_common.py`. This creates `figures/` directory in the dataset root if it doesn't exist, saves as `{name}.{fmt}` with configurable dpi and format.
+**Figure saving:** All functions call `_save_figure()` from `_common.py`. This creates `figures/` directory in the dataset root if it doesn't exist, saves as `{name}.{fmt}` with configurable dpi and format. All public functions expose `dpi: int = 200` and `fmt: str = "png"` parameters for output control.
 
 **Large dataset handling:** Two strategies, both optional:
 - `max_cells: int = 100_000` — random subsampling if N exceeds threshold.
 - `xlim: tuple | None`, `ylim: tuple | None` — bounding box crop (spatial functions only).
-Both are applied before plotting. Subsampling uses `np.random.default_rng(42)` for reproducibility.
+Both are applied before plotting. Order: (1) load coordinates, (2) filter bbox, (3) subsample, (4) resolve `color_by` using the remaining cell IDs. This ordering ensures feature values stay aligned with the plotted cells.
+
+Subsampling uses `np.random.default_rng(42)` to generate indices, then indexes into the DataFrame. This matches the RNG approach used in the rest of the codebase (not `pd.DataFrame.sample`).
 
 **Color conventions:**
 - Categorical: curated publication-friendly palette (distinguishable, colorblind-accessible). Not `tab20`.
@@ -33,7 +35,7 @@ Both are applied before plotting. Subsampling uses `np.random.default_rng(42)` f
 - All continuous plots support `vmin`/`vmax` for manual color scale control.
 - All categorical plots support `palette` override (list of hex colors).
 
-**Dependencies:** matplotlib, seaborn (for violin), tifffile (for multi-page TIF reading). These should be added to `pyproject.toml` as core dependencies.
+**Dependencies:** matplotlib (core), tifffile (already in pyproject.toml). seaborn is used only for `violin` — guard-import it with the project's standard `try/except ImportError` pattern, do not add as core dependency.
 
 ## Module Structure
 
@@ -92,7 +94,7 @@ def _subsample(
 ```
 
 - If `len(df) <= max_cells`, returns `df` unchanged.
-- Otherwise, returns `df.sample(n=max_cells, random_state=random_state)`.
+- Otherwise, uses `np.random.default_rng(random_state)` to generate `max_cells` indices, returns `df.iloc[indices]`.
 
 #### `_filter_bbox`
 
@@ -104,6 +106,7 @@ def _filter_bbox(
 ) -> pd.DataFrame:
 ```
 
+- Expects DataFrame with columns named `"x"` and `"y"`.
 - Filters rows where `x` is within `xlim` and `y` is within `ylim`.
 - If both are None, returns `df` unchanged.
 
@@ -238,7 +241,7 @@ def spatial_polygons(
 ```
 
 - Loads boundaries from `sj.boundaries.load()` (GeoDataFrame).
-- Filters by bounding box using `sj.boundaries.query_bbox(xlim, ylim)` if provided, otherwise uses full extent then subsamples.
+- Filters by bounding box using `sj.boundaries.query_bbox(xlim[0], ylim[0], xlim[1], ylim[1])` if both `xlim` and `ylim` are provided, otherwise uses full extent then subsamples.
 - Resolves `color_by` values, maps to face colors.
 - Uses `matplotlib.collections.PatchCollection` with `shapely` geometry conversion for efficient polygon rendering, or `geopandas.GeoDataFrame.plot()`.
 - Image overlay same as `spatial_scatter`.
@@ -269,6 +272,7 @@ def spatial_expression(
 
 - Convenience wrapper: calls `spatial_scatter(sj, color_by=gene, ...)` if `mode="scatter"`, or `spatial_polygons(sj, color_by=gene, ...)` if `mode="polygon"`.
 - `gene` is required (no default). Raises `ValueError` if gene not found in `sj.expression.gene_names`.
+- For full polygon-mode control (edgecolor, linewidth, alpha), call `spatial_polygons` directly.
 - Saves as `spatial_expression_{gene}.{fmt}`.
 
 ---
@@ -295,7 +299,7 @@ def heatmap(
 
 - Computes mean expression per cluster for each gene.
 - Loads expression for `genes` from `sj.expression`, loads cluster labels from `sj.maps[cluster_key]`.
-- If `standardize=True`, z-scores each gene across clusters (subtract mean, divide by std).
+- If `standardize=True`, z-scores each gene across clusters (subtract mean, divide by std). When `standardize=True` and `cmap` is not explicitly set, defaults to `"RdBu_r"` (diverging) instead of `"magma"`.
 - Plots with `ax.imshow()` or `ax.pcolormesh()`. X-axis = clusters, Y-axis = genes.
 - Adds colorbar. Tick labels for both axes.
 - Auto-sizes figure if `figsize=None`: width based on n_clusters, height based on n_genes.
@@ -478,9 +482,9 @@ _LAZY_IMPORTS = {
 ## Dependencies
 
 Add to `pyproject.toml` under `[project] dependencies`:
-- `matplotlib >= 3.7`
-- `seaborn >= 0.13`
-- `tifffile >= 2023.1`
+- `matplotlib >= 3.7` (new)
+- `tifffile` already present — no change needed
+- `seaborn` NOT added as core dependency — guard-imported in `violin` only
 
 ## Testing Strategy
 
