@@ -16,6 +16,7 @@ from s_spatioloji.data.cells import CellStore
 from s_spatioloji.data.config import SpatiolojiConfig
 from s_spatioloji.data.core import TileView, s_spatioloji
 from s_spatioloji.data.expression import ExpressionStore
+from s_spatioloji.data.images import ImageCollection
 
 # -------------------------------------------------------------------------
 # Dataset dimensions
@@ -317,3 +318,53 @@ class TestRepr:
         r = repr(sj_minimal)
         assert "boundaries=no" in r
         assert "morphology=no" in r
+
+
+# -------------------------------------------------------------------------
+# Tests — images integration
+# -------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def sj_with_images(dataset_path: Path) -> s_spatioloji:
+    """Dataset with images/ directory and images_meta.json."""
+    import json
+
+    img_dir = dataset_path / "images"
+    img_dir.mkdir()
+    data = np.zeros((1, 64, 64), dtype=np.uint16)
+    tifffile.imwrite(
+        str(img_dir / "morphology_focus_0000.ome.tif"),
+        data,
+        photometric="minisblack",
+        metadata={"axes": "CYX"},
+    )
+    meta = {
+        "pixel_size": 0.2125,
+        "default_image": "morphology_focus_0000",
+        "files": {"morphology_focus_0000": "morphology_focus_0000.ome.tif"},
+        "xenium_version": "3.0.0.15",
+    }
+    (dataset_path / "images_meta.json").write_text(json.dumps(meta))
+    return s_spatioloji.open(dataset_path)
+
+
+class TestImages:
+    def test_images_type(self, sj_with_images: s_spatioloji) -> None:
+        assert isinstance(sj_with_images.images, ImageCollection)
+
+    def test_images_keys(self, sj_with_images: s_spatioloji) -> None:
+        assert "morphology_focus_0000" in sj_with_images.images.keys()
+
+    def test_has_images_true(self, sj_with_images: s_spatioloji) -> None:
+        assert sj_with_images.has_images
+
+    def test_has_images_false(self, sj_minimal: s_spatioloji) -> None:
+        assert not sj_minimal.has_images
+
+    def test_morphology_returns_default(self, sj_with_images: s_spatioloji) -> None:
+        store = sj_with_images.morphology
+        assert store is not None
+
+    def test_images_pixel_size(self, sj_with_images: s_spatioloji) -> None:
+        assert sj_with_images.images.pixel_size == 0.2125

@@ -35,7 +35,7 @@ from s_spatioloji.data.boundaries import BoundaryStore
 from s_spatioloji.data.cells import CellStore
 from s_spatioloji.data.config import SpatiolojiConfig
 from s_spatioloji.data.expression import ExpressionStore
-from s_spatioloji.data.images import MorphologyImageStore
+from s_spatioloji.data.images import ImageCollection, MorphologyImageStore
 
 # ---------------------------------------------------------------------------
 # TileView — a spatially scoped sub-object
@@ -291,6 +291,7 @@ class s_spatioloji:
         self._cells: CellStore | None = None
         self._boundaries: BoundaryStore | None = None
         self._morphology: MorphologyImageStore | None = None
+        self._images: ImageCollection | None = None
 
     # ------------------------------------------------------------------
     # Constructors
@@ -430,10 +431,18 @@ class s_spatioloji:
     def morphology(self) -> MorphologyImageStore:
         """Lazy morphology image backend (OME-TIFF + dask.array).
 
+        If an :class:`ImageCollection` is available with a default image,
+        returns that. Otherwise falls back to ``morphology.ome.tif`` at root.
+
         Raises:
-            FileNotFoundError: If ``morphology.ome.tif`` is not present.
+            FileNotFoundError: If no morphology image is available.
                 Check :attr:`has_morphology` before accessing.
         """
+        # Try ImageCollection first
+        if self.has_images and self.images.default_image:
+            return self.images[self.images.default_image]
+
+        # Legacy fallback
         if self._morphology is None:
             p = self.config.paths.morphology
             if not p.exists():
@@ -449,13 +458,38 @@ class s_spatioloji:
     # ------------------------------------------------------------------
 
     @property
+    def images(self) -> ImageCollection:
+        """Lazy-loaded image collection.
+
+        Returns an :class:`~s_spatioloji.data.images.ImageCollection` wrapping
+        all available images with lazy loading. Works even if no images exist
+        (returns an empty collection).
+
+        Returns:
+            An ImageCollection instance.
+        """
+        if self._images is None:
+            self._images = ImageCollection(self.config.root)
+        return self._images
+
+    @property
+    def has_images(self) -> bool:
+        """True if ``images_meta.json`` or ``images/`` directory exists."""
+        return (
+            self.config.paths.images_meta.exists()
+            or self.config.paths.images_dir.exists()
+        )
+
+    @property
     def has_boundaries(self) -> bool:
         """True if ``boundaries.parquet`` exists in the dataset directory."""
         return self.config.paths.boundaries.exists()
 
     @property
     def has_morphology(self) -> bool:
-        """True if ``morphology.ome.tif`` exists in the dataset directory."""
+        """True if any morphology image is available."""
+        if self.has_images and self.images.default_image:
+            return True
         return self.config.paths.morphology.exists()
 
     # ------------------------------------------------------------------
@@ -596,6 +630,8 @@ class s_spatioloji:
             parts.append("n_genes=?")
         parts.append(f"boundaries={'yes' if self.has_boundaries else 'no'}")
         parts.append(f"morphology={'yes' if self.has_morphology else 'no'}")
+        if self.has_images:
+            parts.append(f"images={len(self.images.keys())}")
         return ", ".join(parts) + ")"
 
 
