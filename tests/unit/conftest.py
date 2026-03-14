@@ -134,3 +134,34 @@ def sj_with_clusters(sj_with_graph):
     maps_dir.mkdir(exist_ok=True)
     _atomic_write_parquet(df, maps_dir, "leiden")
     return sj_with_graph
+
+
+@pytest.fixture()
+def sj_with_knn_graph(sj):
+    """sj + pre-built KNN graph (k=6)."""
+    from s_spatioloji.spatial.point.graph import build_knn_graph
+
+    build_knn_graph(sj, k=6)
+    return sj
+
+
+@pytest.fixture()
+def sj_with_pt_clusters(sj_with_knn_graph):
+    """sj_with_knn_graph + synthetic cluster labels in maps/leiden.parquet."""
+    cells_df = sj_with_knn_graph.cells.df.compute()
+    x = cells_df["x"].values
+    y = cells_df["y"].values
+    median_x = np.median(x)
+    median_y = np.median(y)
+    labels = np.where(
+        x < median_x,
+        np.where(y < median_y, 0, 1),
+        np.where(y < median_y, 2, 3),
+    )
+    df = pd.DataFrame({"cell_id": cells_df["cell_id"].values, "leiden": labels})
+    from s_spatioloji.compute import _atomic_write_parquet
+
+    maps_dir = sj_with_knn_graph.config.root / "maps"
+    maps_dir.mkdir(exist_ok=True)
+    _atomic_write_parquet(df, maps_dir, "leiden")
+    return sj_with_knn_graph
