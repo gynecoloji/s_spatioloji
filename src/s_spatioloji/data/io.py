@@ -28,6 +28,7 @@ Optional (platform-dependent):
 from __future__ import annotations
 
 import gzip
+import json
 import shutil
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,109 @@ _MERSCOPE_CELL_COLS: dict[str, str] = {
     "min_y": "y_min",
     "max_y": "y_max",
 }
+
+
+# ---------------------------------------------------------------------------
+# Xenium experiment.xenium + image helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_xenium_specs(src: Path) -> dict:
+    """Read experiment.xenium and return parsed JSON dict.
+
+    Args:
+        src: Xenium output directory.
+
+    Returns:
+        Parsed JSON dict, or empty dict if file not found.
+    """
+    specs_path = src / "experiment.xenium"
+    if not specs_path.exists():
+        return {}
+    with open(str(specs_path)) as f:
+        return json.load(f)
+
+
+def _parse_xenium_version(specs: dict) -> str:
+    """Extract version string from analysis_sw_version.
+
+    Args:
+        specs: Parsed experiment.xenium dict.
+
+    Returns:
+        Version string (e.g., '3.0.0.15') or empty string.
+    """
+    version_str = specs.get("analysis_sw_version", "")
+    if version_str.lower().startswith("xenium-"):
+        return version_str[7:]
+    return version_str
+
+
+def _ingest_xenium_images(
+    src: Path,
+    dst: Path,
+    specs: dict,
+    copy: bool,
+) -> None:
+    """Discover and ingest all Xenium image files.
+
+    Creates ``images/`` directory and ``images_meta.json`` in ``dst``.
+
+    Args:
+        src: Xenium output directory.
+        dst: Dataset output directory.
+        specs: Parsed experiment.xenium dict.
+        copy: If True, copy files; otherwise symlink.
+    """
+    images_dir = dst / "images"
+    images_dir.mkdir(exist_ok=True)
+
+    files: dict[str, str] = {}
+    default_image = ""
+
+    # 1. Discover focus images from morphology_focus/ directory
+    focus_dir = src / "morphology_focus"
+    if focus_dir.exists():
+        focus_files = sorted(focus_dir.glob("*.ome.tif"))
+        for f in focus_files:
+            name = f.stem.replace(".ome", "")
+            files[name] = f.name
+            _link_or_copy(f, images_dir / f.name, copy=copy)
+        if focus_files:
+            first_name = focus_files[0].stem.replace(".ome", "")
+            default_image = first_name
+
+    # 2. Morphology Z-stack
+    morph_src = src / "morphology.ome.tif"
+    if morph_src.exists():
+        files["morphology"] = "morphology.ome.tif"
+        _link_or_copy(morph_src, images_dir / "morphology.ome.tif", copy=copy)
+        if not default_image:
+            default_image = "morphology"
+
+    # 3. MIP (v1 only)
+    mip_src = src / "morphology_mip.ome.tif"
+    if mip_src.exists():
+        files["morphology_mip"] = "morphology_mip.ome.tif"
+        _link_or_copy(mip_src, images_dir / "morphology_mip.ome.tif", copy=copy)
+
+    # 4. Backward compat: symlink default focus to root morphology.ome.tif
+    if default_image and default_image.startswith("morphology_focus"):
+        compat_src = images_dir / files[default_image]
+        compat_dst = dst / "morphology.ome.tif"
+        _link_or_copy(compat_src, compat_dst, copy=copy)
+
+    # 5. Write images_meta.json
+    pixel_size = specs.get("pixel_size", 0.2125)
+    meta = {
+        "pixel_size": pixel_size,
+        "default_image": default_image,
+        "files": files,
+        "xenium_version": _parse_xenium_version(specs),
+    }
+    meta_path = dst / "images_meta.json"
+    with open(str(meta_path), "w") as f:
+        json.dump(meta, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +264,9 @@ def from_xenium(
         gdf = _read_xenium_boundaries(boundary_file)
         BoundaryStore.create(cfg.paths.boundaries, gdf)
 
-    # ---- 4. Morphology image (optional) ----------------------------------
-    morph_src = src / "morphology.ome.tif"
-    if morph_src.exists():
-        _link_or_copy(morph_src, cfg.paths.morphology, copy=copy_image)
+    # ---- 4. Images + experiment.xenium -----------------------------------
+    specs = _parse_xenium_specs(src)
+    _ingest_xenium_images(src, dst, specs, copy=copy_image)
 
     return s_spatioloji.open(dst)
 

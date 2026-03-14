@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 from pathlib import Path
 
 import geopandas as gpd
@@ -424,3 +425,95 @@ class TestLinkOrCopy:
         _link_or_copy(src, dst, copy=False)
         assert dst.exists()
         assert dst.read_bytes() == b"world"
+
+
+# ===========================================================================
+# Tests — from_xenium with images
+# ===========================================================================
+
+
+def _create_xenium_images(xenium_dir: Path) -> None:
+    """Create mock Xenium image files and experiment.xenium."""
+    data = np.zeros((1, 64, 64), dtype=np.uint16)
+
+    tifffile.imwrite(
+        str(xenium_dir / "morphology.ome.tif"), data,
+        photometric="minisblack", metadata={"axes": "CYX"},
+    )
+
+    focus_dir = xenium_dir / "morphology_focus"
+    focus_dir.mkdir()
+    for i in range(4):
+        tifffile.imwrite(
+            str(focus_dir / f"morphology_focus_{i:04d}.ome.tif"), data,
+            photometric="minisblack", metadata={"axes": "CYX"},
+        )
+
+    specs = {
+        "pixel_size": 0.2125,
+        "analysis_sw_version": "xenium-3.0.0.15",
+        "images": {
+            "morphology_filepath": "morphology.ome.tif",
+            "morphology_focus_filepath": "morphology_focus/morphology_focus_0000.ome.tif",
+        },
+    }
+    (xenium_dir / "experiment.xenium").write_text(json.dumps(specs))
+
+
+@pytest.fixture()
+def xenium_dir_with_images(tmp_path: Path) -> Path:
+    """Xenium mock directory with image files and experiment.xenium."""
+    src = _make_xenium_dir(tmp_path / "xenium", with_image=False)
+    _create_xenium_images(src)
+    return src
+
+
+class TestFromXeniumImages:
+    def test_images_meta_written(self, xenium_dir_with_images: Path, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        sj = from_xenium(xenium_dir_with_images, out)
+        assert (out / "images_meta.json").exists()
+        meta = json.loads((out / "images_meta.json").read_text())
+        assert meta["pixel_size"] == 0.2125
+
+    def test_focus_images_ingested(self, xenium_dir_with_images: Path, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        sj = from_xenium(xenium_dir_with_images, out)
+        assert (out / "images").is_dir()
+        assert (out / "images" / "morphology_focus_0000.ome.tif").exists()
+        assert (out / "images" / "morphology_focus_0003.ome.tif").exists()
+
+    def test_morphology_zstack_ingested(self, xenium_dir_with_images: Path, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        sj = from_xenium(xenium_dir_with_images, out)
+        assert (out / "images" / "morphology.ome.tif").exists()
+
+    def test_images_collection_works(self, xenium_dir_with_images: Path, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        sj = from_xenium(xenium_dir_with_images, out)
+        assert sj.has_images
+        assert "morphology_focus_0000" in sj.images.keys()
+        assert sj.images.pixel_size == 0.2125
+
+    def test_backward_compat_symlink(self, xenium_dir_with_images: Path, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        sj = from_xenium(xenium_dir_with_images, out)
+        assert (out / "morphology.ome.tif").exists()
+
+    def test_default_image_is_focus_0000(self, xenium_dir_with_images: Path, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        sj = from_xenium(xenium_dir_with_images, out)
+        assert sj.images.default_image == "morphology_focus_0000"
+
+    def test_xenium_version_parsed(self, xenium_dir_with_images: Path, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        sj = from_xenium(xenium_dir_with_images, out)
+        meta = json.loads((out / "images_meta.json").read_text())
+        assert meta["xenium_version"] == "3.0.0.15"
+
+    def test_all_four_focus_channels(self, xenium_dir_with_images: Path, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        sj = from_xenium(xenium_dir_with_images, out)
+        keys = sj.images.keys()
+        for i in range(4):
+            assert f"morphology_focus_{i:04d}" in keys
