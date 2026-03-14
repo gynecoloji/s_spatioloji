@@ -165,3 +165,22 @@ def sj_with_pt_clusters(sj_with_knn_graph):
     maps_dir.mkdir(exist_ok=True)
     _atomic_write_parquet(df, maps_dir, "leiden")
     return sj_with_knn_graph
+
+
+@pytest.fixture()
+def sj_with_embeddings(sj_with_pt_clusters):
+    """sj_with_pt_clusters + synthetic UMAP coordinates in maps/X_umap.parquet."""
+    rng = np.random.default_rng(42)
+    cells_df = sj_with_pt_clusters.cells.df.compute()
+    n = len(cells_df)
+    umap_df = pd.DataFrame({
+        "cell_id": cells_df["cell_id"].values,
+        "UMAP_1": rng.standard_normal(n),
+        "UMAP_2": rng.standard_normal(n),
+    })
+    from s_spatioloji.compute import _atomic_write_parquet
+
+    maps_dir = sj_with_pt_clusters.config.root / "maps"
+    maps_dir.mkdir(exist_ok=True)
+    _atomic_write_parquet(umap_df, maps_dir, "X_umap")
+    return sj_with_pt_clusters
