@@ -94,6 +94,16 @@ class StorePaths:
         return self.root / "morphology.ome.tif"
 
     @property
+    def images_dir(self) -> Path:
+        """Path to the images/ directory."""
+        return self.root / "images"
+
+    @property
+    def images_meta(self) -> Path:
+        """Path to images_meta.json."""
+        return self.root / "images_meta.json"
+
+    @property
     def index(self) -> Path:
         """Path to the precomputed index directory."""
         return self.root / "_index"

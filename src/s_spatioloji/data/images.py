@@ -18,15 +18,18 @@ Pyramid levels:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import dask.array as da
 import numpy as np
+import pandas as pd
 import tifffile
 import zarr
 
 if TYPE_CHECKING:
+    import geopandas as gpd
     from numpy.typing import NDArray
 
 
@@ -248,6 +251,40 @@ class MorphologyImageStore:
         scale = 2 ** level  # each level is 2× downsampled
         return round(um / (px_size * scale))
 
+    def pixel_size_at(self, level: int = 0) -> float:
+        """Physical pixel size in µm at a given pyramid level.
+
+        Each level is 2x downsampled, so pixel size doubles per level.
+
+        Args:
+            level: Pyramid level (0 = full resolution).
+
+        Returns:
+            Pixel size in micrometers.
+
+        Raises:
+            ValueError: If ``level`` is out of range.
+        """
+        self._check_level(level)
+        return self._pixel_size_um() * (2 ** level)
+
+    def px_to_um(self, px: float, level: int = 0) -> float:
+        """Convert pixels to micrometers at a given pyramid level.
+
+        Args:
+            px: Distance in pixels.
+            level: Pyramid level (pixel size scales with downsampling factor).
+
+        Returns:
+            Equivalent distance in micrometers.
+
+        Raises:
+            ValueError: If ``px`` is negative.
+        """
+        if px < 0:
+            raise ValueError(f"px must be non-negative, got {px}")
+        return px * self.pixel_size_at(level)
+
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
@@ -299,3 +336,186 @@ class MorphologyImageStore:
         except Exception:
             pass
         return 1.0
+
+
+# ---------------------------------------------------------------------------
+# ImageCollection
+# ---------------------------------------------------------------------------
+
+
+class ImageCollection:
+    """Lazy collection of named MorphologyImageStore instances.
+
+    Reads ``images_meta.json`` for pixel size and file registry.
+    Falls back to wrapping a single ``morphology.ome.tif`` at the
+    dataset root for backward compatibility with older datasets.
+
+    Args:
+        root: Dataset root directory.
+
+    Example:
+        >>> ic = ImageCollection(root)
+        >>> store = ic["morphology_focus_0000"]
+        >>> ic.pixel_size_at(level=3)
+        1.7
+    """
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._stores: dict[str, MorphologyImageStore | None] = {}
+        self._files: dict[str, str] = {}
+        self._pixel_size: float = 1.0
+        self._default_image: str = ""
+        self._xenium_version: str = ""
+
+        meta_path = root / "images_meta.json"
+
+        if meta_path.exists():
+            with open(str(meta_path)) as f:
+                meta = json.load(f)
+            self._pixel_size = meta.get("pixel_size", 1.0)
+            self._default_image = meta.get("default_image", "")
+            self._files = meta.get("files", {})
+            self._xenium_version = meta.get("xenium_version", "")
+            for name in self._files:
+                self._stores[name] = None
+        elif (root / "morphology.ome.tif").exists():
+            self._files = {"morphology": "morphology.ome.tif"}
+            self._stores = {"morphology": None}
+            self._default_image = "morphology"
+            self._pixel_size = 1.0
+
+    @property
+    def pixel_size(self) -> float:
+        """Base pixel size in µm (level 0)."""
+        return self._pixel_size
+
+    def pixel_size_at(self, level: int = 0) -> float:
+        """Pixel size at a given pyramid level: ``pixel_size * 2^level``.
+
+        Args:
+            level: Pyramid level (0 = full resolution).
+
+        Returns:
+            Pixel size in micrometers.
+        """
+        return self._pixel_size * (2 ** level)
+
+    @property
+    def default_image(self) -> str:
+        """Name of the default image (typically ``'morphology_focus_0000'``)."""
+        return self._default_image
+
+    def keys(self) -> list[str]:
+        """List of available image names.
+
+        Returns:
+            Sorted list of image name strings.
+        """
+        return sorted(self._files.keys())
+
+    def has(self, name: str) -> bool:
+        """Check if an image is available.
+
+        Args:
+            name: Image name to check.
+
+        Returns:
+            True if the image exists in the collection.
+        """
+        return name in self._files
+
+    def __getitem__(self, name: str) -> MorphologyImageStore:
+        """Lazy-load and return a MorphologyImageStore by name.
+
+        Args:
+            name: Image name (e.g., ``"morphology_focus_0000"``).
+
+        Returns:
+            A :class:`MorphologyImageStore` instance.
+
+        Raises:
+            KeyError: If ``name`` is not in the collection.
+        """
+        if name not in self._files:
+            raise KeyError(f"Image '{name}' not found. Available: {self.keys()}")
+
+        if self._stores[name] is None:
+            filename = self._files[name]
+            images_dir = self._root / "images"
+            if (images_dir / filename).exists():
+                path = images_dir / filename
+            else:
+                path = self._root / filename
+            self._stores[name] = MorphologyImageStore.open(path)
+
+        return self._stores[name]
+
+    def scale_coordinates(
+        self,
+        df: pd.DataFrame,
+        level: int = 0,
+    ) -> pd.DataFrame:
+        """Scale x, y columns from µm to pixels at the given pyramid level.
+
+        Returns a copy. Formula: ``px = um / pixel_size_at(level)``.
+
+        Args:
+            df: DataFrame with ``x`` and ``y`` columns in micrometers.
+            level: Pyramid level.
+
+        Returns:
+            DataFrame copy with x, y scaled to pixels.
+        """
+        ps = self.pixel_size_at(level)
+        result = df.copy()
+        result["x"] = result["x"] / ps
+        result["y"] = result["y"] / ps
+        return result
+
+    def scale_polygons(
+        self,
+        gdf: gpd.GeoDataFrame,
+        level: int = 0,
+    ) -> gpd.GeoDataFrame:
+        """Scale polygon geometries from µm to pixels at the given level.
+
+        Returns a copy.
+
+        Args:
+            gdf: GeoDataFrame with geometry column in micrometers.
+            level: Pyramid level.
+
+        Returns:
+            GeoDataFrame copy with scaled geometries.
+        """
+        from shapely.affinity import scale as shapely_scale
+
+        ps = self.pixel_size_at(level)
+        factor = 1.0 / ps
+        result = gdf.copy()
+        result["geometry"] = result["geometry"].apply(
+            lambda g: shapely_scale(g, xfact=factor, yfact=factor, origin=(0, 0))
+        )
+        return result
+
+    def close(self) -> None:
+        """Close all opened image stores."""
+        for name, store in self._stores.items():
+            if store is not None:
+                store.close()
+                self._stores[name] = None
+
+    def __enter__(self) -> ImageCollection:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"ImageCollection("
+            f"n_images={len(self._files)}, "
+            f"pixel_size={self._pixel_size}, "
+            f"keys={self.keys()})"
+        )
