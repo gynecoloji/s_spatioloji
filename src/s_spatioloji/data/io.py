@@ -199,10 +199,13 @@ def from_xenium(
     cells and expression):
 
     - ``cells.parquet`` or ``cells.csv.gz`` — cell metadata
-    - ``cell_feature_matrix/`` — 10x-format sparse expression matrix
-      (``barcodes.tsv.gz``, ``features.tsv.gz``, ``matrix.mtx.gz``)
+    - ``cell_feature_matrix.h5`` (HDF5, preferred) or
+      ``cell_feature_matrix/`` directory (10x MTX format with
+      ``barcodes.tsv.gz``, ``features.tsv.gz``, ``matrix.mtx.gz``)
     - ``cell_boundaries.parquet`` or ``nucleus_boundaries.parquet``
-    - ``morphology.ome.tif``
+    - ``morphology_focus/`` directory (multi-channel OME-TIFFs)
+    - ``morphology.ome.tif`` (Z-stack)
+    - ``experiment.xenium`` (metadata with pixel size)
 
     Args:
         xenium_dir: Root directory of the Xenium output.
@@ -223,7 +226,8 @@ def from_xenium(
         FileNotFoundError: If ``xenium_dir`` does not exist.
         FileNotFoundError: If neither ``cells.parquet`` nor ``cells.csv.gz``
             is found in ``xenium_dir``.
-        FileNotFoundError: If ``cell_feature_matrix/`` is missing.
+        FileNotFoundError: If neither ``cell_feature_matrix.h5`` nor
+            ``cell_feature_matrix/`` is found.
 
     Example:
         >>> sj = from_xenium("/data/xenium_run1", "/data/processed/run1")
@@ -244,7 +248,7 @@ def from_xenium(
     CellStore.create(cfg.paths.cells, cells_df)
 
     # ---- 2. Expression matrix --------------------------------------------
-    expr_matrix, gene_names, cell_ids = _read_10x_mtx(src / "cell_feature_matrix")
+    expr_matrix, gene_names, cell_ids = _read_xenium_expression(src)
     n_cells, n_genes = expr_matrix.shape
     store = ExpressionStore.create(
         cfg.paths.expression,
@@ -490,6 +494,103 @@ def _read_10x_mtx(
     matrix = mat_csr.toarray().astype(np.uint16)
 
     return matrix, gene_names, cell_ids
+
+
+def _read_10x_h5(
+    h5_path: Path,
+) -> tuple[np.ndarray, list[str], list[str]]:  # type: ignore[type-arg]
+    """Read a 10x-format HDF5 expression matrix into a dense uint16 array.
+
+    Handles both v3 (``/matrix/``) and v2 (root-level) HDF5 layouts used
+    by Xenium and Cell Ranger.
+
+    Args:
+        h5_path: Path to ``cell_feature_matrix.h5``.
+
+    Returns:
+        Tuple of ``(matrix, gene_names, cell_ids)`` where ``matrix`` has
+        shape ``(n_cells, n_genes)`` and dtype ``uint16``.
+
+    Raises:
+        FileNotFoundError: If ``h5_path`` does not exist.
+    """
+    try:
+        import h5py
+    except ImportError:
+        raise ImportError("Install h5py: pip install h5py")
+
+    try:
+        from scipy.sparse import csc_matrix
+    except ImportError:
+        raise ImportError("Install scipy: pip install scipy")
+
+    if not h5_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
+
+    with h5py.File(str(h5_path), "r") as f:
+        # Determine root group: v3 uses /matrix/, v2 stores at root
+        if "matrix" in f:
+            grp = f["matrix"]
+        else:
+            grp = f
+
+        # Read sparse CSC components
+        data = grp["data"][:]
+        indices = grp["indices"][:]
+        indptr = grp["indptr"][:]
+        shape = tuple(grp["shape"][:])
+
+        # Barcodes (cell IDs)
+        barcodes_raw = grp["barcodes"][:]
+        cell_ids = [b.decode("utf-8") if isinstance(b, bytes) else str(b) for b in barcodes_raw]
+
+        # Gene names — try features/name (v3), then gene_names (v2)
+        if "features" in grp:
+            feat_grp = grp["features"]
+            names_raw = feat_grp["name"][:]
+        elif "gene_names" in grp:
+            names_raw = grp["gene_names"][:]
+        else:
+            # Fallback: use feature IDs
+            names_raw = feat_grp["id"][:] if "features" in grp else np.arange(shape[0]).astype(bytes)
+
+        gene_names = [n.decode("utf-8") if isinstance(n, bytes) else str(n) for n in names_raw]
+
+    # Build sparse matrix — HDF5 stores as (genes × cells) CSC
+    mat = csc_matrix((data, indices, indptr), shape=shape)
+    # Transpose to (cells × genes)
+    matrix = mat.T.toarray().astype(np.uint16)
+
+    return matrix, gene_names, cell_ids
+
+
+def _read_xenium_expression(
+    src: Path,
+) -> tuple[np.ndarray, list[str], list[str]]:  # type: ignore[type-arg]
+    """Read Xenium expression matrix, trying H5 first then MTX directory.
+
+    Args:
+        src: Xenium output directory.
+
+    Returns:
+        Tuple of ``(matrix, gene_names, cell_ids)`` with dtype ``uint16``.
+
+    Raises:
+        FileNotFoundError: If neither ``cell_feature_matrix.h5`` nor
+            ``cell_feature_matrix/`` is found.
+    """
+    h5_path = src / "cell_feature_matrix.h5"
+    mtx_dir = src / "cell_feature_matrix"
+
+    if h5_path.exists():
+        return _read_10x_h5(h5_path)
+    elif mtx_dir.exists():
+        return _read_10x_mtx(mtx_dir)
+    else:
+        raise FileNotFoundError(
+            f"No expression matrix found in {src}. "
+            "Expected 'cell_feature_matrix.h5' or 'cell_feature_matrix/' directory."
+        )
 
 
 # ---------------------------------------------------------------------------
