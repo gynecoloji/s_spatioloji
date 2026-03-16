@@ -157,6 +157,7 @@ def umap(
     low_memory: bool = True,
     n_jobs: int = -1,
     gpu: bool = False,
+    max_cells_gpu: int | None = None,
     conda_env: str | None = None,
     timeout: int = 7200,
     input_key: str = "X_pca",
@@ -167,6 +168,10 @@ def umap(
 
     Supports CPU (``umap-learn``), in-process GPU (``cuml``), and
     conda-bridge GPU (run ``cuml`` in a separate RAPIDS conda env).
+
+    When ``max_cells_gpu`` is set, fits UMAP on a GPU-friendly subsample
+    then projects remaining cells on CPU in chunks — avoids GPU OOM on
+    very large datasets.
 
     Args:
         sj: Dataset instance.
@@ -180,6 +185,10 @@ def umap(
         n_jobs: Number of parallel workers for KNN (CPU only).
             ``-1`` = all cores.
         gpu: If ``True``, use ``cuml.UMAP`` for GPU acceleration.
+        max_cells_gpu: Maximum cells to send to GPU.  If the dataset
+            exceeds this, UMAP is fit on a subsample via GPU, then
+            remaining cells are projected on CPU.  ``None`` = send all
+            to GPU (may OOM on large datasets).
         conda_env: Conda environment name containing RAPIDS.  When set
             with ``gpu=True``, runs GPU UMAP via subprocess in the
             specified conda env.  ``None`` = in-process.
@@ -195,11 +204,13 @@ def umap(
         ImportError: If required packages are not installed.
 
     Example:
-        >>> umap(sj)                                        # CPU
+        >>> umap(sj)                                            # CPU
         'X_umap'
-        >>> umap(sj, gpu=True)                              # GPU in-process
+        >>> umap(sj, gpu=True)                                  # GPU all cells
         'X_umap'
-        >>> umap(sj, gpu=True, conda_env="rapids")          # GPU via conda
+        >>> umap(sj, gpu=True, max_cells_gpu=2_000_000)        # GPU fit + CPU project
+        'X_umap'
+        >>> umap(sj, gpu=True, conda_env="rapids")             # GPU via conda
         'X_umap'
     """
     import json
@@ -215,12 +226,24 @@ def umap(
     maps_dir.mkdir(exist_ok=True)
     matrix, cell_ids, _ = _load_dense(sj, input_key)
     matrix = matrix.astype(np.float32)
+    n_cells = matrix.shape[0]
+
+    # Determine if we need subsample-fit-then-project
+    need_subsample = gpu and max_cells_gpu is not None and n_cells > max_cells_gpu
+
+    if need_subsample:
+        rng = np.random.default_rng(42)
+        sub_idx = rng.choice(n_cells, max_cells_gpu, replace=False)
+        sub_idx.sort()
+        sub_matrix = matrix[sub_idx]
+    else:
+        sub_matrix = matrix
 
     if gpu and conda_env is not None:
         # Run GPU UMAP in a separate RAPIDS conda environment
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = _Path(tmpdir)
-            np.savez(tmpdir / "input.npz", X=matrix)
+            np.savez(tmpdir / "input.npz", X=sub_matrix)
 
             kwargs_dict = {
                 "fn": "gpu_umap",
@@ -246,7 +269,24 @@ def umap(
                 )
 
             with np.load(output_path) as data:
-                embedding = data["X"]
+                sub_embedding = data["X"]
+
+        if need_subsample:
+            # CPU project remaining cells using umap-learn
+            try:
+                from umap import UMAP
+            except ImportError:
+                raise ImportError("CPU projection requires umap-learn: pip install umap-learn") from None
+            # Rebuild CPU model from subsample fit
+            cpu_model = UMAP(
+                n_neighbors=n_neighbors, min_dist=min_dist,
+                low_memory=True, n_jobs=n_jobs, random_state=42,
+            )
+            cpu_model.fit(sub_matrix)
+            # Project all cells in chunks
+            embedding = _chunked_umap_transform(cpu_model, matrix, chunk_size=50_000)
+        else:
+            embedding = sub_embedding
 
     elif gpu:
         # In-process GPU UMAP
@@ -255,7 +295,6 @@ def umap(
         except ImportError:
             raise ImportError(
                 "GPU mode requires cuml (NVIDIA RAPIDS). "
-                "Install with: pip install cuml-cu12  (or cuml-cu11). "
                 "Or use conda_env='your_rapids_env' to run in a separate env."
             ) from None
 
@@ -268,10 +307,28 @@ def umap(
             kwargs["n_epochs"] = n_epochs
 
         model = cuUMAP(**kwargs)
-        embedding = model.fit_transform(matrix)
-        if hasattr(embedding, "get"):
-            embedding = embedding.get()
-        embedding = np.asarray(embedding)
+
+        if need_subsample:
+            model.fit(sub_matrix)
+            sub_embedding = model.transform(sub_matrix)
+            if hasattr(sub_embedding, "get"):
+                sub_embedding = sub_embedding.get()
+            # Project remaining cells on CPU
+            try:
+                from umap import UMAP
+            except ImportError:
+                raise ImportError("CPU projection requires umap-learn: pip install umap-learn") from None
+            cpu_model = UMAP(
+                n_neighbors=n_neighbors, min_dist=min_dist,
+                low_memory=True, n_jobs=n_jobs, random_state=42,
+            )
+            cpu_model.fit(sub_matrix)
+            embedding = _chunked_umap_transform(cpu_model, matrix, chunk_size=50_000)
+        else:
+            embedding = model.fit_transform(matrix)
+            if hasattr(embedding, "get"):
+                embedding = embedding.get()
+            embedding = np.asarray(embedding)
 
     else:
         # CPU UMAP
@@ -293,10 +350,33 @@ def umap(
         model = UMAP(**kwargs)
         embedding = model.fit_transform(matrix)
 
-    df = pd.DataFrame(embedding, columns=["UMAP_1", "UMAP_2"])
+    df = pd.DataFrame(np.asarray(embedding), columns=["UMAP_1", "UMAP_2"])
     df.insert(0, "cell_id", cell_ids)
     _atomic_write_parquet(df, maps_dir, output_key)
     return output_key
+
+
+def _chunked_umap_transform(
+    model,
+    matrix: np.ndarray,
+    chunk_size: int = 50_000,
+) -> np.ndarray:
+    """Project cells through a fitted UMAP model in chunks.
+
+    Args:
+        model: Fitted umap.UMAP model.
+        matrix: Full (n_cells, n_features) array.
+        chunk_size: Cells per chunk.
+
+    Returns:
+        (n_cells, 2) embedding array.
+    """
+    n_cells = matrix.shape[0]
+    embedding = np.empty((n_cells, 2), dtype=np.float32)
+    for start in range(0, n_cells, chunk_size):
+        end = min(start + chunk_size, n_cells)
+        embedding[start:end] = model.transform(matrix[start:end])
+    return embedding
 
 
 def tsne(

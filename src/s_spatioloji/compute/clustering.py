@@ -75,6 +75,7 @@ def leiden(
     n_neighbors: int = 15,
     n_jobs: int = -1,
     gpu: bool = False,
+    max_cells_gpu: int | None = None,
     conda_env: str | None = None,
     timeout: int = 7200,
     input_key: str = "X_pca",
@@ -85,12 +86,19 @@ def leiden(
 
     Supports CPU, in-process GPU, and conda-bridge GPU backends.
 
+    When ``max_cells_gpu`` is set and the dataset exceeds it, clusters a
+    subsample on GPU then transfers labels to remaining cells via
+    nearest-neighbor lookup on CPU.
+
     Args:
         sj: Dataset instance.
         resolution: Resolution parameter (higher = more clusters).
         n_neighbors: Number of neighbours for KNN graph.
         n_jobs: Parallel workers for KNN building (CPU only). ``-1`` = all cores.
         gpu: If ``True``, use ``cuml`` + ``cugraph`` for GPU acceleration.
+        max_cells_gpu: Maximum cells to send to GPU.  If exceeded,
+            clusters a subsample on GPU and transfers labels to remaining
+            cells via KNN on CPU.  ``None`` = send all to GPU.
         conda_env: Conda environment name containing RAPIDS.  When set
             with ``gpu=True``, runs GPU Leiden via subprocess.
         timeout: Subprocess timeout in seconds (only for conda_env mode).
@@ -105,11 +113,13 @@ def leiden(
         ImportError: If required packages are not installed.
 
     Example:
-        >>> leiden(sj, resolution=1.0)                       # CPU
+        >>> leiden(sj, resolution=1.0)                            # CPU
         'leiden'
-        >>> leiden(sj, gpu=True)                             # GPU in-process
+        >>> leiden(sj, gpu=True)                                  # GPU all cells
         'leiden'
-        >>> leiden(sj, gpu=True, conda_env="rapids")         # GPU via conda
+        >>> leiden(sj, gpu=True, max_cells_gpu=2_000_000)        # GPU + CPU transfer
+        'leiden'
+        >>> leiden(sj, gpu=True, conda_env="rapids")             # GPU via conda
         'leiden'
     """
     import json
@@ -127,11 +137,22 @@ def leiden(
     matrix = matrix.astype(np.float32)
     n_cells = matrix.shape[0]
 
+    # Determine if we need subsample + label transfer
+    need_subsample = gpu and max_cells_gpu is not None and n_cells > max_cells_gpu
+
+    if need_subsample:
+        rng = np.random.default_rng(42)
+        sub_idx = rng.choice(n_cells, max_cells_gpu, replace=False)
+        sub_idx.sort()
+        sub_matrix = matrix[sub_idx]
+    else:
+        sub_matrix = matrix
+
     if gpu and conda_env is not None:
         # Run GPU Leiden in a separate RAPIDS conda environment
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = _Path(tmpdir)
-            np.savez(tmpdir / "input.npz", X=matrix)
+            np.savez(tmpdir / "input.npz", X=sub_matrix)
 
             kwargs_dict = {
                 "fn": "gpu_leiden",
@@ -156,7 +177,12 @@ def leiden(
                 )
 
             with np.load(output_path) as data:
-                labels = data["labels"]
+                sub_labels = data["labels"]
+
+        if need_subsample:
+            labels = _transfer_labels(matrix, sub_matrix, sub_labels, n_jobs=n_jobs)
+        else:
+            labels = sub_labels
 
     elif gpu:
         # In-process GPU Leiden
@@ -176,16 +202,17 @@ def leiden(
                 "Install with: pip install cugraph-cu12"
             ) from None
 
-        k = min(n_neighbors, n_cells - 1)
+        n_sub = sub_matrix.shape[0]
+        k = min(n_neighbors, n_sub - 1)
         nn = cuNearestNeighbors(n_neighbors=k + 1)
-        nn.fit(matrix)
-        _, indices = nn.kneighbors(matrix)
+        nn.fit(sub_matrix)
+        _, indices = nn.kneighbors(sub_matrix)
 
         if hasattr(indices, "get"):
             indices = indices.get()
         indices = np.asarray(indices)[:, 1:]
 
-        sources = np.repeat(np.arange(n_cells), k)
+        sources = np.repeat(np.arange(n_sub), k)
         targets = indices.ravel()
         lo = np.minimum(sources, targets)
         hi = np.maximum(sources, targets)
@@ -198,10 +225,15 @@ def leiden(
         G.from_cudf_edgelist(edge_df, source="src", destination="dst")
         parts, _ = cugraph.leiden(G, resolution=resolution)
         parts = parts.sort_values("vertex").reset_index(drop=True)
-        labels = parts["partition"].values
-        if hasattr(labels, "get"):
-            labels = labels.get()
-        labels = np.asarray(labels)
+        sub_labels = parts["partition"].values
+        if hasattr(sub_labels, "get"):
+            sub_labels = sub_labels.get()
+        sub_labels = np.asarray(sub_labels)
+
+        if need_subsample:
+            labels = _transfer_labels(matrix, sub_matrix, sub_labels, n_jobs=n_jobs)
+        else:
+            labels = sub_labels
 
     else:
         # CPU Leiden
@@ -219,9 +251,46 @@ def leiden(
         )
         labels = partition.membership
 
-    df = pd.DataFrame({"cell_id": cell_ids, output_key: labels})
+    df = pd.DataFrame({"cell_id": cell_ids, output_key: np.asarray(labels)})
     _atomic_write_parquet(df, maps_dir, output_key)
     return output_key
+
+
+def _transfer_labels(
+    full_matrix: np.ndarray,
+    sub_matrix: np.ndarray,
+    sub_labels: np.ndarray,
+    n_jobs: int = -1,
+    chunk_size: int = 50_000,
+) -> np.ndarray:
+    """Transfer cluster labels from a subsample to the full dataset.
+
+    For each cell in ``full_matrix``, finds its nearest neighbor in
+    ``sub_matrix`` and assigns that neighbor's cluster label.
+    Processed in chunks to keep RAM bounded.
+
+    Args:
+        full_matrix: (n_cells, n_features) array.
+        sub_matrix: (n_subsample, n_features) array.
+        sub_labels: (n_subsample,) cluster labels.
+        n_jobs: Parallel workers for KNN.
+        chunk_size: Cells per chunk for projection.
+
+    Returns:
+        (n_cells,) array of cluster labels.
+    """
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(sub_matrix)
+    n_cells = full_matrix.shape[0]
+    labels = np.empty(n_cells, dtype=sub_labels.dtype)
+
+    for start in range(0, n_cells, chunk_size):
+        end = min(start + chunk_size, n_cells)
+        _, nn_idx = tree.query(full_matrix[start:end], k=1, workers=n_jobs)
+        labels[start:end] = sub_labels[nn_idx]
+
+    return labels
 
 
 def louvain(
