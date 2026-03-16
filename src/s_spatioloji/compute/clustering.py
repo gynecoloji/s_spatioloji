@@ -75,15 +75,15 @@ def leiden(
     n_neighbors: int = 15,
     n_jobs: int = -1,
     gpu: bool = False,
+    conda_env: str | None = None,
+    timeout: int = 7200,
     input_key: str = "X_pca",
     output_key: str = "leiden",
     force: bool = True,
 ) -> str:
     """Leiden community detection on a KNN graph.
 
-    Supports both CPU and GPU backends.  CPU mode uses ``pynndescent``
-    (approximate KNN, fast) if available, otherwise ``scipy.spatial.cKDTree``.
-    GPU mode uses ``cuml`` for KNN and ``cugraph`` for Leiden.
+    Supports CPU, in-process GPU, and conda-bridge GPU backends.
 
     Args:
         sj: Dataset instance.
@@ -91,6 +91,9 @@ def leiden(
         n_neighbors: Number of neighbours for KNN graph.
         n_jobs: Parallel workers for KNN building (CPU only). ``-1`` = all cores.
         gpu: If ``True``, use ``cuml`` + ``cugraph`` for GPU acceleration.
+        conda_env: Conda environment name containing RAPIDS.  When set
+            with ``gpu=True``, runs GPU Leiden via subprocess.
+        timeout: Subprocess timeout in seconds (only for conda_env mode).
         input_key: Key to read input from (typically PCA embedding).
         output_key: Key to write cluster labels under.
         force: If ``False``, skip if output already exists.
@@ -102,13 +105,18 @@ def leiden(
         ImportError: If required packages are not installed.
 
     Example:
-        >>> leiden(sj, resolution=1.0)
+        >>> leiden(sj, resolution=1.0)                       # CPU
         'leiden'
-        >>> leiden(sj, gpu=True)                     # GPU (~10x faster)
+        >>> leiden(sj, gpu=True)                             # GPU in-process
         'leiden'
-        >>> leiden(sj, n_neighbors=30, n_jobs=8)     # fast CPU
+        >>> leiden(sj, gpu=True, conda_env="rapids")         # GPU via conda
         'leiden'
     """
+    import json
+    import subprocess
+    import tempfile
+    from pathlib import Path as _Path
+
     maps_dir = sj.config.root / "maps"
     out_path = maps_dir / f"{output_key}.parquet"
     if not force and out_path.exists():
@@ -119,34 +127,64 @@ def leiden(
     matrix = matrix.astype(np.float32)
     n_cells = matrix.shape[0]
 
-    if gpu:
+    if gpu and conda_env is not None:
+        # Run GPU Leiden in a separate RAPIDS conda environment
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = _Path(tmpdir)
+            np.savez(tmpdir / "input.npz", X=matrix)
+
+            kwargs_dict = {
+                "fn": "gpu_leiden",
+                "n_neighbors": n_neighbors,
+                "resolution": resolution,
+            }
+            (tmpdir / "kwargs.json").write_text(json.dumps(kwargs_dict))
+
+            output_path = tmpdir / "output.npz"
+            cmd = [
+                "conda", "run", "-n", conda_env,
+                "python", "-m", "s_spatioloji.compute._runner",
+                "--fn", "gpu_leiden",
+                "--input", str(tmpdir / "input.npz"),
+                "--output", str(output_path),
+                "--kwargs-file", str(tmpdir / "kwargs.json"),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"GPU Leiden failed in conda env '{conda_env}':\n{result.stderr}"
+                )
+
+            with np.load(output_path) as data:
+                labels = data["labels"]
+
+    elif gpu:
+        # In-process GPU Leiden
         try:
             from cuml.neighbors import NearestNeighbors as cuNearestNeighbors
         except ImportError:
             raise ImportError(
                 "GPU mode requires cuml + cugraph (NVIDIA RAPIDS). "
-                "See https://rapids.ai/start.html"
+                "Or use conda_env='your_rapids_env' to run in a separate env."
             ) from None
         try:
-            import cugraph
             import cudf
+            import cugraph
         except ImportError:
             raise ImportError(
                 "GPU Leiden requires cugraph. "
-                "Install with: pip install cugraph-cu12  (or cu11)"
+                "Install with: pip install cugraph-cu12"
             ) from None
 
         k = min(n_neighbors, n_cells - 1)
         nn = cuNearestNeighbors(n_neighbors=k + 1)
         nn.fit(matrix)
-        distances, indices = nn.kneighbors(matrix)
+        _, indices = nn.kneighbors(matrix)
 
-        # Convert to numpy if cupy
         if hasattr(indices, "get"):
             indices = indices.get()
-        indices = np.asarray(indices)[:, 1:]  # drop self
+        indices = np.asarray(indices)[:, 1:]
 
-        # Build edge list
         sources = np.repeat(np.arange(n_cells), k)
         targets = indices.ravel()
         lo = np.minimum(sources, targets)
@@ -155,7 +193,6 @@ def leiden(
         mask = edge_pairs[:, 0] != edge_pairs[:, 1]
         edge_pairs = edge_pairs[mask]
 
-        # cugraph Leiden
         edge_df = cudf.DataFrame({"src": edge_pairs[:, 0], "dst": edge_pairs[:, 1]})
         G = cugraph.Graph()
         G.from_cudf_edgelist(edge_df, source="src", destination="dst")
@@ -165,7 +202,9 @@ def leiden(
         if hasattr(labels, "get"):
             labels = labels.get()
         labels = np.asarray(labels)
+
     else:
+        # CPU Leiden
         try:
             import igraph as ig
             import leidenalg

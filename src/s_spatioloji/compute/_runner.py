@@ -88,10 +88,73 @@ def _handle_scvi_train(input_path: Path, output_path: Path, kwargs: dict) -> Non
     model.save(str(model_dir), overwrite=True)
 
 
+def _handle_gpu_umap(input_path: Path, output_path: Path, kwargs: dict) -> None:
+    """Run GPU UMAP via cuml."""
+    from cuml.manifold import UMAP
+
+    data = np.load(input_path)
+    X = data["X"].astype(np.float32)
+
+    umap_kwargs = {
+        "n_neighbors": kwargs.get("n_neighbors", 15),
+        "min_dist": kwargs.get("min_dist", 0.5),
+        "random_state": 42,
+    }
+    if "n_epochs" in kwargs and kwargs["n_epochs"] is not None:
+        umap_kwargs["n_epochs"] = kwargs["n_epochs"]
+
+    model = UMAP(**umap_kwargs)
+    embedding = model.fit_transform(X)
+    if hasattr(embedding, "get"):
+        embedding = embedding.get()
+    np.savez(output_path, X=np.asarray(embedding, dtype=np.float32))
+
+
+def _handle_gpu_leiden(input_path: Path, output_path: Path, kwargs: dict) -> None:
+    """Run GPU Leiden via cuml (KNN) + cugraph (Leiden)."""
+    import cudf
+    import cugraph
+    from cuml.neighbors import NearestNeighbors
+
+    data = np.load(input_path)
+    X = data["X"].astype(np.float32)
+    n_cells = X.shape[0]
+    n_neighbors = kwargs.get("n_neighbors", 15)
+    resolution = kwargs.get("resolution", 1.0)
+    k = min(n_neighbors, n_cells - 1)
+
+    nn = NearestNeighbors(n_neighbors=k + 1)
+    nn.fit(X)
+    _, indices = nn.kneighbors(X)
+    if hasattr(indices, "get"):
+        indices = indices.get()
+    indices = np.asarray(indices)[:, 1:]
+
+    sources = np.repeat(np.arange(n_cells), k)
+    targets = indices.ravel()
+    lo = np.minimum(sources, targets)
+    hi = np.maximum(sources, targets)
+    edge_pairs = np.unique(np.column_stack([lo, hi]), axis=0)
+    mask = edge_pairs[:, 0] != edge_pairs[:, 1]
+    edge_pairs = edge_pairs[mask]
+
+    edge_df = cudf.DataFrame({"src": edge_pairs[:, 0], "dst": edge_pairs[:, 1]})
+    G = cugraph.Graph()
+    G.from_cudf_edgelist(edge_df, source="src", destination="dst")
+    parts, _ = cugraph.leiden(G, resolution=resolution)
+    parts = parts.sort_values("vertex").reset_index(drop=True)
+    labels = parts["partition"].values
+    if hasattr(labels, "get"):
+        labels = labels.get()
+    np.savez(output_path, labels=np.asarray(labels, dtype=np.int32))
+
+
 _HANDLERS = {
     "magic": _handle_magic,
     "alra": _handle_alra,
     "scvi_train": _handle_scvi_train,
+    "gpu_umap": _handle_gpu_umap,
+    "gpu_leiden": _handle_gpu_leiden,
 }
 
 

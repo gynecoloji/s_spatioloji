@@ -157,14 +157,16 @@ def umap(
     low_memory: bool = True,
     n_jobs: int = -1,
     gpu: bool = False,
+    conda_env: str | None = None,
+    timeout: int = 7200,
     input_key: str = "X_pca",
     output_key: str = "X_umap",
     force: bool = True,
 ) -> str:
     """UMAP embedding of the dataset.
 
-    Supports both CPU (``umap-learn``) and GPU (``cuml``) backends.
-    GPU mode is ~10-15x faster for large datasets.
+    Supports CPU (``umap-learn``), in-process GPU (``cuml``), and
+    conda-bridge GPU (run ``cuml`` in a separate RAPIDS conda env).
 
     Args:
         sj: Dataset instance.
@@ -177,8 +179,11 @@ def umap(
             (CPU only).  Recommended for datasets over 1M cells.
         n_jobs: Number of parallel workers for KNN (CPU only).
             ``-1`` = all cores.
-        gpu: If ``True``, use ``cuml.UMAP`` (NVIDIA RAPIDS) for GPU
-            acceleration.  Requires ``cuml`` to be installed.
+        gpu: If ``True``, use ``cuml.UMAP`` for GPU acceleration.
+        conda_env: Conda environment name containing RAPIDS.  When set
+            with ``gpu=True``, runs GPU UMAP via subprocess in the
+            specified conda env.  ``None`` = in-process.
+        timeout: Subprocess timeout in seconds (only for conda_env mode).
         input_key: Key to read input from (typically PCA embedding).
         output_key: Key to write the 2-D embedding under.
         force: If ``False``, skip if output already exists.
@@ -187,17 +192,21 @@ def umap(
         The *output_key* string.
 
     Raises:
-        ImportError: If ``umap-learn`` (CPU) or ``cuml`` (GPU) is not
-            installed.
+        ImportError: If required packages are not installed.
 
     Example:
-        >>> umap(sj)                                    # CPU
+        >>> umap(sj)                                        # CPU
         'X_umap'
-        >>> umap(sj, gpu=True)                          # GPU (~10x faster)
+        >>> umap(sj, gpu=True)                              # GPU in-process
         'X_umap'
-        >>> umap(sj, n_epochs=200, n_jobs=8)            # fast CPU
+        >>> umap(sj, gpu=True, conda_env="rapids")          # GPU via conda
         'X_umap'
     """
+    import json
+    import subprocess
+    import tempfile
+    from pathlib import Path as _Path
+
     maps_dir = sj.config.root / "maps"
     out_path = maps_dir / f"{output_key}.parquet"
     if not force and out_path.exists():
@@ -207,14 +216,47 @@ def umap(
     matrix, cell_ids, _ = _load_dense(sj, input_key)
     matrix = matrix.astype(np.float32)
 
-    if gpu:
+    if gpu and conda_env is not None:
+        # Run GPU UMAP in a separate RAPIDS conda environment
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = _Path(tmpdir)
+            np.savez(tmpdir / "input.npz", X=matrix)
+
+            kwargs_dict = {
+                "fn": "gpu_umap",
+                "n_neighbors": n_neighbors,
+                "min_dist": min_dist,
+                "n_epochs": n_epochs,
+            }
+            (tmpdir / "kwargs.json").write_text(json.dumps(kwargs_dict))
+
+            output_path = tmpdir / "output.npz"
+            cmd = [
+                "conda", "run", "-n", conda_env,
+                "python", "-m", "s_spatioloji.compute._runner",
+                "--fn", "gpu_umap",
+                "--input", str(tmpdir / "input.npz"),
+                "--output", str(output_path),
+                "--kwargs-file", str(tmpdir / "kwargs.json"),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"GPU UMAP failed in conda env '{conda_env}':\n{result.stderr}"
+                )
+
+            with np.load(output_path) as data:
+                embedding = data["X"]
+
+    elif gpu:
+        # In-process GPU UMAP
         try:
             from cuml.manifold import UMAP as cuUMAP
         except ImportError:
             raise ImportError(
                 "GPU mode requires cuml (NVIDIA RAPIDS). "
-                "Install with: pip install cuml-cu12  (or cuml-cu11 for CUDA 11). "
-                "See https://rapids.ai/start.html for installation instructions."
+                "Install with: pip install cuml-cu12  (or cuml-cu11). "
+                "Or use conda_env='your_rapids_env' to run in a separate env."
             ) from None
 
         kwargs: dict = {
@@ -227,11 +269,12 @@ def umap(
 
         model = cuUMAP(**kwargs)
         embedding = model.fit_transform(matrix)
-        # cuml returns cupy array or numpy — ensure numpy
         if hasattr(embedding, "get"):
             embedding = embedding.get()
         embedding = np.asarray(embedding)
+
     else:
+        # CPU UMAP
         try:
             from umap import UMAP
         except ImportError:
