@@ -156,25 +156,29 @@ def umap(
     n_epochs: int | None = None,
     low_memory: bool = True,
     n_jobs: int = -1,
+    gpu: bool = False,
     input_key: str = "X_pca",
     output_key: str = "X_umap",
     force: bool = True,
 ) -> str:
     """UMAP embedding of the dataset.
 
-    Optimized for large datasets with ``low_memory=True`` (reduces peak
-    RAM) and ``n_jobs=-1`` (parallel KNN graph building).
+    Supports both CPU (``umap-learn``) and GPU (``cuml``) backends.
+    GPU mode is ~10-15x faster for large datasets.
 
     Args:
         sj: Dataset instance.
         n_neighbors: Number of neighbours for the UMAP graph.
         min_dist: Minimum distance between points in the embedding.
         n_epochs: Number of optimization epochs.  ``None`` uses the
-            umap-learn default (200 for large datasets, 500 for small).
-            Set to 200 or lower for faster results on 10M+ cells.
-        low_memory: Use low-memory mode for KNN graph construction.
-            Recommended for datasets over 1M cells.
-        n_jobs: Number of parallel workers for KNN.  ``-1`` = all cores.
+            library default.  Set to 200 or lower for faster results
+            on 10M+ cells.
+        low_memory: Use low-memory mode for KNN graph construction
+            (CPU only).  Recommended for datasets over 1M cells.
+        n_jobs: Number of parallel workers for KNN (CPU only).
+            ``-1`` = all cores.
+        gpu: If ``True``, use ``cuml.UMAP`` (NVIDIA RAPIDS) for GPU
+            acceleration.  Requires ``cuml`` to be installed.
         input_key: Key to read input from (typically PCA embedding).
         output_key: Key to write the 2-D embedding under.
         force: If ``False``, skip if output already exists.
@@ -183,19 +187,17 @@ def umap(
         The *output_key* string.
 
     Raises:
-        ImportError: If ``umap-learn`` is not installed.
+        ImportError: If ``umap-learn`` (CPU) or ``cuml`` (GPU) is not
+            installed.
 
     Example:
-        >>> umap(sj)
+        >>> umap(sj)                                    # CPU
         'X_umap'
-        >>> umap(sj, n_epochs=200, n_jobs=8)  # faster on large datasets
+        >>> umap(sj, gpu=True)                          # GPU (~10x faster)
+        'X_umap'
+        >>> umap(sj, n_epochs=200, n_jobs=8)            # fast CPU
         'X_umap'
     """
-    try:
-        from umap import UMAP
-    except ImportError:
-        raise ImportError("Install with: pip install umap-learn") from None
-
     maps_dir = sj.config.root / "maps"
     out_path = maps_dir / f"{output_key}.parquet"
     if not force and out_path.exists():
@@ -205,18 +207,48 @@ def umap(
     matrix, cell_ids, _ = _load_dense(sj, input_key)
     matrix = matrix.astype(np.float32)
 
-    kwargs: dict = {
-        "n_neighbors": n_neighbors,
-        "min_dist": min_dist,
-        "low_memory": low_memory,
-        "n_jobs": n_jobs,
-        "random_state": 42,
-    }
-    if n_epochs is not None:
-        kwargs["n_epochs"] = n_epochs
+    if gpu:
+        try:
+            from cuml.manifold import UMAP as cuUMAP
+        except ImportError:
+            raise ImportError(
+                "GPU mode requires cuml (NVIDIA RAPIDS). "
+                "Install with: pip install cuml-cu12  (or cuml-cu11 for CUDA 11). "
+                "See https://rapids.ai/start.html for installation instructions."
+            ) from None
 
-    model = UMAP(**kwargs)
-    embedding = model.fit_transform(matrix)
+        kwargs: dict = {
+            "n_neighbors": n_neighbors,
+            "min_dist": min_dist,
+            "random_state": 42,
+        }
+        if n_epochs is not None:
+            kwargs["n_epochs"] = n_epochs
+
+        model = cuUMAP(**kwargs)
+        embedding = model.fit_transform(matrix)
+        # cuml returns cupy array or numpy — ensure numpy
+        if hasattr(embedding, "get"):
+            embedding = embedding.get()
+        embedding = np.asarray(embedding)
+    else:
+        try:
+            from umap import UMAP
+        except ImportError:
+            raise ImportError("Install with: pip install umap-learn") from None
+
+        kwargs = {
+            "n_neighbors": n_neighbors,
+            "min_dist": min_dist,
+            "low_memory": low_memory,
+            "n_jobs": n_jobs,
+            "random_state": 42,
+        }
+        if n_epochs is not None:
+            kwargs["n_epochs"] = n_epochs
+
+        model = UMAP(**kwargs)
+        embedding = model.fit_transform(matrix)
 
     df = pd.DataFrame(embedding, columns=["UMAP_1", "UMAP_2"])
     df.insert(0, "cell_id", cell_ids)
