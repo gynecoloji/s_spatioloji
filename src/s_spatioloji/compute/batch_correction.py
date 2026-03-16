@@ -15,7 +15,6 @@ from s_spatioloji.compute import (
     _atomic_write_parquet,
     _atomic_write_zarr,
     _load_dense,
-    _load_hvg_genes,
 )
 
 if TYPE_CHECKING:
@@ -30,6 +29,9 @@ def harmony(
     force: bool = True,
 ) -> str:
     """Harmony batch correction on a PCA embedding.
+
+    Scalable to 10M+ cells — operates on the PCA embedding (typically
+    50 components), not the full expression matrix.
 
     Args:
         sj: Dataset instance.
@@ -68,142 +70,6 @@ def harmony(
     corrected = ho.Z_corr.T  # (n_components, n_cells) → (n_cells, n_components)
 
     df = pd.DataFrame(corrected, columns=gene_names)
-    df.insert(0, "cell_id", cell_ids)
-    _atomic_write_parquet(df, maps_dir, output_key)
-    return output_key
-
-
-def combat(
-    sj: s_spatioloji,
-    batch_key: str = "fov_id",
-    input_key: str = "X_log1p",
-    hvg_key: str = "hvg",
-    output_key: str = "X_combat",
-    save_expression: bool = True,
-    force: bool = True,
-) -> str:
-    """ComBat batch correction (in-process, no conda bridge).
-
-    Operates on the full input matrix.  Writes an HVG-subset Parquet
-    and optionally a full-expression Zarr.
-
-    Args:
-        sj: Dataset instance.
-        batch_key: Column in ``cells.parquet`` containing batch labels.
-        input_key: Key to read log-normalized expression from.
-        hvg_key: Key for the HVG table.
-        output_key: Key to write corrected HVG-subset under.
-        save_expression: If ``True``, also write full corrected matrix
-            to ``expression_combat.zarr/``.
-        force: If ``False``, skip if output already exists.
-
-    Returns:
-        The *output_key* string.
-
-    Raises:
-        ImportError: If ``pycombat`` is not installed.
-
-    Example:
-        >>> combat(sj, batch_key="fov_id")
-        'X_combat'
-    """
-    try:
-        from combat.pycombat import pycombat
-    except ImportError:
-        raise ImportError("Install with: pip install s_spatioloji[batch]") from None
-
-    maps_dir = sj.config.root / "maps"
-    out_path = maps_dir / f"{output_key}.parquet"
-    if not force and out_path.exists():
-        return output_key
-
-    maps_dir.mkdir(exist_ok=True)
-    matrix, cell_ids, gene_names = _load_dense(sj, input_key)
-    matrix = matrix.astype(np.float32)
-
-    cells_df = sj.cells.df.compute()
-    batch_labels = list(cells_df[batch_key])
-
-    # pycombat expects (n_genes, n_cells) DataFrame
-    expr_df = pd.DataFrame(matrix.T, index=gene_names, columns=cell_ids)
-    corrected = pycombat(expr_df, batch_labels)
-    corrected_matrix = corrected.values.T  # back to (n_cells, n_genes)
-
-    # HVG subset for Parquet
-    hvg_genes = _load_hvg_genes(sj, hvg_key)
-    hvg_idx = [gene_names.index(g) for g in hvg_genes if g in gene_names]
-    hvg_names = [gene_names[i] for i in hvg_idx]
-    hvg_subset = corrected_matrix[:, hvg_idx]
-
-    df = pd.DataFrame(hvg_subset, columns=hvg_names)
-    df.insert(0, "cell_id", cell_ids)
-    _atomic_write_parquet(df, maps_dir, output_key)
-
-    if save_expression:
-        zarr_path = sj.config.root / "expression_combat.zarr"
-        _atomic_write_zarr(corrected_matrix, cell_ids, gene_names, zarr_path, sj.config.chunks)
-
-    return output_key
-
-
-def regress_out(
-    sj: s_spatioloji,
-    keys: list[str] | None = None,
-    input_key: str = "X_log1p",
-    hvg_key: str = "hvg",
-    output_key: str = "X_regressed",
-    force: bool = True,
-) -> str:
-    """Regress out confounding variables from expression.
-
-    Fits a linear model per gene with the specified cell metadata columns
-    as covariates and returns the residuals.  Output is HVG-subset only.
-
-    Args:
-        sj: Dataset instance.
-        keys: Cell metadata columns to regress out.  Defaults to
-            ``["transcript_counts"]``.
-        input_key: Key to read expression from.
-        hvg_key: Key for the HVG table.
-        output_key: Key to write residuals under.
-        force: If ``False``, skip if output already exists.
-
-    Returns:
-        The *output_key* string.
-
-    Example:
-        >>> regress_out(sj, keys=["transcript_counts"])
-        'X_regressed'
-    """
-    if keys is None:
-        keys = ["transcript_counts"]
-
-    maps_dir = sj.config.root / "maps"
-    out_path = maps_dir / f"{output_key}.parquet"
-    if not force and out_path.exists():
-        return output_key
-
-    maps_dir.mkdir(exist_ok=True)
-    matrix, cell_ids, gene_names = _load_dense(sj, input_key)
-    matrix = matrix.astype(np.float32)
-
-    # HVG subset
-    hvg_genes = _load_hvg_genes(sj, hvg_key)
-    hvg_idx = [gene_names.index(g) for g in hvg_genes if g in gene_names]
-    hvg_names = [gene_names[i] for i in hvg_idx]
-    matrix = matrix[:, hvg_idx]
-
-    # Build design matrix from cell metadata
-    cells_df = sj.cells.df.compute()
-    design = np.column_stack([cells_df[k].values.astype(np.float64) for k in keys])
-    design = np.column_stack([np.ones(len(cell_ids)), design])  # intercept
-
-    # OLS per gene: residuals = Y - X @ (X^T X)^-1 X^T Y
-    XtX_inv = np.linalg.pinv(design.T @ design)
-    hat = design @ XtX_inv @ design.T
-    residuals = matrix - (hat @ matrix.astype(np.float64)).astype(np.float32)
-
-    df = pd.DataFrame(residuals, columns=hvg_names)
     df.insert(0, "cell_id", cell_ids)
     _atomic_write_parquet(df, maps_dir, output_key)
     return output_key
