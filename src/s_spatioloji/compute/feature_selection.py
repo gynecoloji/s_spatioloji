@@ -2,6 +2,9 @@
 
 All functions follow the compute layer contract: accept an ``s_spatioloji``
 object, write results to ``maps/``, and return the output key string.
+
+Uses chunked streaming to compute per-gene statistics without loading the
+full expression matrix into memory.
 """
 
 from __future__ import annotations
@@ -11,7 +14,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from s_spatioloji.compute import _atomic_write_parquet, _load_dense
+from s_spatioloji.compute import _atomic_write_parquet
+from s_spatioloji.compute.normalize import (
+    _get_gene_names,
+    _get_n_genes,
+    _iter_expression_chunks,
+)
 
 if TYPE_CHECKING:
     from s_spatioloji.data.core import s_spatioloji
@@ -26,7 +34,8 @@ def highly_variable_genes(
 ) -> str:
     """Identify highly variable genes by dispersion ranking.
 
-    Computes mean, variance, and dispersion (variance / mean) per gene,
+    Computes mean, variance, and dispersion (variance / mean) per gene
+    using a single streaming pass over the data (Welford's algorithm),
     then selects the top *n_top* genes by dispersion.
 
     Args:
@@ -49,14 +58,28 @@ def highly_variable_genes(
         return output_key
 
     maps_dir.mkdir(exist_ok=True)
-    matrix, _, gene_names = _load_dense(sj, input_key)
-    matrix = matrix.astype(np.float32)
+    gene_names = _get_gene_names(sj, input_key)
+    n_genes = _get_n_genes(sj, input_key)
 
-    means = matrix.mean(axis=0)
-    variances = matrix.var(axis=0)
+    # Streaming mean and variance (Welford's online algorithm)
+    mean = np.zeros(n_genes, dtype=np.float64)
+    m2 = np.zeros(n_genes, dtype=np.float64)
+    count = 0
+
+    for start, end, chunk in _iter_expression_chunks(sj, input_key):
+        chunk = chunk.astype(np.float64)
+        for i in range(chunk.shape[0]):
+            count += 1
+            delta = chunk[i] - mean
+            mean += delta / count
+            delta2 = chunk[i] - mean
+            m2 += delta * delta2
+
+    means = mean.astype(np.float32)
+    variances = (m2 / max(count - 1, 1)).astype(np.float32)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        dispersions = np.where(means > 0, variances / means, 0.0)
+        dispersions = np.where(means > 0, variances / means, 0.0).astype(np.float32)
 
     n_select = min(n_top, len(gene_names))
     top_idx = np.argsort(dispersions)[::-1][:n_select]
@@ -67,9 +90,9 @@ def highly_variable_genes(
         {
             "gene": gene_names,
             "highly_variable": is_hvg,
-            "mean": means.astype(np.float32),
-            "variance": variances.astype(np.float32),
-            "dispersion": dispersions.astype(np.float32),
+            "mean": means,
+            "variance": variances,
+            "dispersion": dispersions,
         }
     )
     _atomic_write_parquet(df, maps_dir, output_key)

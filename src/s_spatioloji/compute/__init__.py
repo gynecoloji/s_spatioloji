@@ -26,10 +26,15 @@ if TYPE_CHECKING:
 def _load_dense(sj: s_spatioloji, key: str) -> tuple[np.ndarray, list[str], list[str]]:
     """Load expression data as a dense numpy array.
 
+    Handles three formats:
+    - ``"expression"`` → raw Zarr expression store
+    - ``maps/<key>.zarr`` → Zarr compute result (ExpressionStore)
+    - ``maps/<key>.parquet`` → Parquet compute result (DataFrame)
+
     Args:
         sj: s_spatioloji instance.
         key: ``"expression"`` for the raw Zarr store, or a ``maps/`` key
-            for a Parquet result.
+            for a Parquet or Zarr result.
 
     Returns:
         Tuple of ``(matrix, cell_ids, gene_names)`` where *matrix* has
@@ -42,7 +47,18 @@ def _load_dense(sj: s_spatioloji, key: str) -> tuple[np.ndarray, list[str], list
         gene_names = list(names) if names is not None else [f"gene_{i}" for i in range(sj.n_genes)]
         return matrix, cell_ids, gene_names
 
-    df = sj.maps[key].compute()
+    from s_spatioloji.data.expression import ExpressionStore
+
+    result = sj.maps[key]
+    if isinstance(result, ExpressionStore):
+        matrix = result.to_dask().compute()
+        ids = result.cell_ids
+        cell_ids = list(ids) if ids is not None else list(sj.cells.df.compute()["cell_id"])
+        names = result.gene_names
+        gene_names = list(names) if names is not None else [f"gene_{i}" for i in range(result.n_genes)]
+        return matrix, cell_ids, gene_names
+
+    df = result.compute()
     cell_ids = list(df["cell_id"])
     gene_names = [c for c in df.columns if c != "cell_id"]
     matrix = df[gene_names].values

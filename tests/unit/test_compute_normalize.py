@@ -5,6 +5,18 @@ from __future__ import annotations
 import numpy as np
 
 from s_spatioloji.compute.normalize import log1p, normalize_total, pearson_residuals, scale
+from s_spatioloji.data.expression import ExpressionStore
+
+
+def _load_result(sj, key):
+    """Load a compute result, handling both Parquet and Zarr outputs."""
+    result = sj.maps[key]
+    if isinstance(result, ExpressionStore):
+        return result.to_dask().compute(), result.gene_names
+    # dask DataFrame (Parquet)
+    df = result.compute()
+    gene_cols = [c for c in df.columns if c != "cell_id"]
+    return df[gene_cols].values, gene_cols
 
 
 class TestNormalizeTotal:
@@ -17,32 +29,23 @@ class TestNormalizeTotal:
 
     def test_shape(self, sj):
         normalize_total(sj)
-        df = sj.maps["X_norm"].compute()
-        assert df.shape == (200, 31)  # 30 genes + cell_id
-
-    def test_cell_id_column(self, sj):
-        normalize_total(sj)
-        df = sj.maps["X_norm"].compute()
-        assert df.columns[0] == "cell_id"
-        assert df["cell_id"].iloc[0] == "cell_0"
+        matrix, genes = _load_result(sj, "X_norm")
+        assert matrix.shape == (200, 30)
 
     def test_row_sums(self, sj):
         normalize_total(sj, target_sum=1e4)
-        df = sj.maps["X_norm"].compute()
-        gene_cols = [c for c in df.columns if c != "cell_id"]
-        row_sums = df[gene_cols].values.sum(axis=1)
-        # All non-zero rows should sum to target_sum
+        matrix, _ = _load_result(sj, "X_norm")
+        row_sums = matrix.sum(axis=1)
         nonzero = row_sums[row_sums > 0]
         np.testing.assert_allclose(nonzero, 1e4, rtol=1e-5)
 
     def test_force_false_skips(self, sj):
         normalize_total(sj)
-        # Modify the output to detect if it gets overwritten
-        df = sj.maps["X_norm"].compute()
-        original_val = df.iloc[0, 1]
+        matrix1, _ = _load_result(sj, "X_norm")
+        original_val = matrix1[0, 0]
         normalize_total(sj, target_sum=999, force=False)
-        df2 = sj.maps["X_norm"].compute()
-        assert df2.iloc[0, 1] == original_val  # not overwritten
+        matrix2, _ = _load_result(sj, "X_norm")
+        assert matrix2[0, 0] == original_val
 
 
 class TestLog1p:
@@ -57,17 +60,16 @@ class TestLog1p:
 
     def test_values_are_log_transformed(self, sj):
         normalize_total(sj)
-        norm_df = sj.maps["X_norm"].compute()
+        norm_matrix, _ = _load_result(sj, "X_norm")
         log1p(sj)
-        log_df = sj.maps["X_log1p"].compute()
-        gene_cols = [c for c in norm_df.columns if c != "cell_id"]
-        expected = np.log1p(norm_df[gene_cols].values.astype(np.float32))
-        np.testing.assert_allclose(log_df[gene_cols].values, expected, rtol=1e-5)
+        log_matrix, _ = _load_result(sj, "X_log1p")
+        expected = np.log1p(norm_matrix.astype(np.float32))
+        np.testing.assert_allclose(log_matrix, expected, rtol=1e-5)
 
     def test_force_false_skips(self, sj):
         normalize_total(sj)
         log1p(sj)
-        log1p(sj, force=False)  # should not raise
+        log1p(sj, force=False)
 
 
 class TestScale:
@@ -87,7 +89,7 @@ class TestScale:
         highly_variable_genes(sj, n_top=20)
         scale(sj, hvg=True)
         df = sj.maps["X_scaled"].compute()
-        # 20 HVGs + cell_id = 21 columns
+        # 20 HVGs + cell_id = 21 columns (Parquet output for HVG subset)
         assert df.shape[1] == 21
         assert df.shape[0] == 200
 
@@ -122,19 +124,17 @@ class TestPearsonResiduals:
 
     def test_shape(self, sj):
         pearson_residuals(sj)
-        df = sj.maps["X_residuals"].compute()
-        assert df.shape == (200, 31)  # 30 genes + cell_id
+        matrix, _ = _load_result(sj, "X_residuals")
+        assert matrix.shape == (200, 30)
 
     def test_values_finite(self, sj):
         pearson_residuals(sj)
-        df = sj.maps["X_residuals"].compute()
-        gene_cols = [c for c in df.columns if c != "cell_id"]
-        assert np.all(np.isfinite(df[gene_cols].values))
+        matrix, _ = _load_result(sj, "X_residuals")
+        assert np.all(np.isfinite(matrix))
 
     def test_clipped(self, sj):
         pearson_residuals(sj)
-        df = sj.maps["X_residuals"].compute()
-        gene_cols = [c for c in df.columns if c != "cell_id"]
+        matrix, _ = _load_result(sj, "X_residuals")
         clip_val = np.sqrt(200)
-        assert df[gene_cols].values.max() <= clip_val + 1e-5
-        assert df[gene_cols].values.min() >= -clip_val - 1e-5
+        assert matrix.max() <= clip_val + 1e-5
+        assert matrix.min() >= -clip_val - 1e-5
