@@ -27,12 +27,13 @@ def pca(
     output_key: str = "X_pca",
     output_loadings_key: str = "X_pca_loadings",
     force: bool = True,
+    chunk_size: int = 50_000,
 ) -> str:
-    """PCA via subsample-fit then project-all.
+    """PCA via subsample-fit then chunked project-all.
 
     Fits PCA on a subsample of cells (if dataset is large) then projects
-    all cells into the learned space.  ``n_components`` is automatically
-    clamped to ``min(n_components, n_cells - 1, n_features)``.
+    all cells into the learned space in chunks.  ``n_components`` is
+    automatically clamped to ``min(n_components, n_cells - 1, n_features)``.
 
     Args:
         sj: Dataset instance.
@@ -45,6 +46,7 @@ def pca(
         output_key: Key for the embedding output.
         output_loadings_key: Key for the gene loadings side-output.
         force: If ``False``, skip if **both** outputs already exist.
+        chunk_size: Number of cells per processing chunk. Lower = less RAM.
 
     Returns:
         The *output_key* string.
@@ -52,8 +54,18 @@ def pca(
     Example:
         >>> pca(sj, n_components=50)
         'X_pca'
+        >>> pca(sj, chunk_size=10_000)  # use less RAM
+        'X_pca'
     """
     from sklearn.decomposition import PCA as _PCA
+
+    from s_spatioloji.compute.normalize import (
+        _get_cell_ids,
+        _get_gene_names,
+        _get_n_cells,
+        _get_n_genes,
+        _iter_expression_chunks,
+    )
 
     maps_dir = sj.config.root / "maps"
     out_path = maps_dir / f"{output_key}.parquet"
@@ -62,32 +74,71 @@ def pca(
         return output_key
 
     maps_dir.mkdir(exist_ok=True)
-    matrix, cell_ids, gene_names = _load_dense(sj, input_key)
 
+    gene_names = _get_gene_names(sj, input_key)
+    cell_ids = _get_cell_ids(sj, input_key)
+    n_cells = _get_n_cells(sj, input_key)
+
+    # Determine HVG subset indices
+    gene_idx = None
     if hvg:
         hvg_genes = _load_hvg_genes(sj, hvg_key)
         gene_idx = [gene_names.index(g) for g in hvg_genes if g in gene_names]
-        matrix = matrix[:, gene_idx]
         gene_names = [gene_names[i] for i in gene_idx]
 
-    matrix = matrix.astype(np.float32)
-    n_cells, n_features = matrix.shape
+    n_features = len(gene_names)
     n_comp = min(n_components, n_cells - 1, n_features)
 
-    if n_cells > n_subsample:
-        rng = np.random.default_rng(42)
-        idx = rng.choice(n_cells, n_subsample, replace=False)
-        fit_data = matrix[idx]
-    else:
-        fit_data = matrix
+    # Pass 1: collect subsample for fitting
+    fit_rows = []
+    n_collected = 0
+    rng = np.random.default_rng(42)
+
+    for start, end, chunk in _iter_expression_chunks(sj, input_key, chunk_size=chunk_size):
+        chunk = chunk.astype(np.float32)
+        if gene_idx is not None:
+            chunk = chunk[:, gene_idx]
+
+        if n_cells <= n_subsample:
+            fit_rows.append(chunk)
+        else:
+            # Reservoir-style: keep proportional sample from each chunk
+            n_chunk = chunk.shape[0]
+            n_take = max(1, int(n_subsample * n_chunk / n_cells))
+            if n_take >= n_chunk:
+                fit_rows.append(chunk)
+            else:
+                idx = rng.choice(n_chunk, n_take, replace=False)
+                fit_rows.append(chunk[idx])
+            n_collected += n_chunk
+
+    fit_data = np.concatenate(fit_rows, axis=0)
+    if fit_data.shape[0] > n_subsample:
+        idx = rng.choice(fit_data.shape[0], n_subsample, replace=False)
+        fit_data = fit_data[idx]
 
     model = _PCA(n_components=n_comp)
     model.fit(fit_data)
-    embedding = model.transform(matrix)
+    del fit_data, fit_rows  # free memory
 
+    # Pass 2: project all cells in chunks
     comp_cols = [f"PC_{i + 1}" for i in range(n_comp)]
-    df = pd.DataFrame(embedding, columns=comp_cols)
-    df.insert(0, "cell_id", cell_ids)
+    embedding_chunks = []
+    cell_id_offset = 0
+
+    for start, end, chunk in _iter_expression_chunks(sj, input_key, chunk_size=chunk_size):
+        chunk = chunk.astype(np.float32)
+        if gene_idx is not None:
+            chunk = chunk[:, gene_idx]
+        projected = model.transform(chunk)
+        n = chunk.shape[0]
+        chunk_ids = cell_ids[cell_id_offset:cell_id_offset + n]
+        cell_id_offset += n
+        chunk_df = pd.DataFrame(projected, columns=comp_cols)
+        chunk_df.insert(0, "cell_id", chunk_ids)
+        embedding_chunks.append(chunk_df)
+
+    df = pd.concat(embedding_chunks, ignore_index=True)
     _atomic_write_parquet(df, maps_dir, output_key)
 
     loadings = model.components_.T  # (n_features, n_comp)
