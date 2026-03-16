@@ -152,15 +152,29 @@ def pca(
 def umap(
     sj: s_spatioloji,
     n_neighbors: int = 15,
+    min_dist: float = 0.5,
+    n_epochs: int | None = None,
+    low_memory: bool = True,
+    n_jobs: int = -1,
     input_key: str = "X_pca",
     output_key: str = "X_umap",
     force: bool = True,
 ) -> str:
     """UMAP embedding of the dataset.
 
+    Optimized for large datasets with ``low_memory=True`` (reduces peak
+    RAM) and ``n_jobs=-1`` (parallel KNN graph building).
+
     Args:
         sj: Dataset instance.
         n_neighbors: Number of neighbours for the UMAP graph.
+        min_dist: Minimum distance between points in the embedding.
+        n_epochs: Number of optimization epochs.  ``None`` uses the
+            umap-learn default (200 for large datasets, 500 for small).
+            Set to 200 or lower for faster results on 10M+ cells.
+        low_memory: Use low-memory mode for KNN graph construction.
+            Recommended for datasets over 1M cells.
+        n_jobs: Number of parallel workers for KNN.  ``-1`` = all cores.
         input_key: Key to read input from (typically PCA embedding).
         output_key: Key to write the 2-D embedding under.
         force: If ``False``, skip if output already exists.
@@ -174,11 +188,13 @@ def umap(
     Example:
         >>> umap(sj)
         'X_umap'
+        >>> umap(sj, n_epochs=200, n_jobs=8)  # faster on large datasets
+        'X_umap'
     """
     try:
         from umap import UMAP
     except ImportError:
-        raise ImportError("Install with: pip install s_spatioloji[reduction]") from None
+        raise ImportError("Install with: pip install umap-learn") from None
 
     maps_dir = sj.config.root / "maps"
     out_path = maps_dir / f"{output_key}.parquet"
@@ -189,7 +205,17 @@ def umap(
     matrix, cell_ids, _ = _load_dense(sj, input_key)
     matrix = matrix.astype(np.float32)
 
-    model = UMAP(n_neighbors=n_neighbors, random_state=42)
+    kwargs: dict = {
+        "n_neighbors": n_neighbors,
+        "min_dist": min_dist,
+        "low_memory": low_memory,
+        "n_jobs": n_jobs,
+        "random_state": 42,
+    }
+    if n_epochs is not None:
+        kwargs["n_epochs"] = n_epochs
+
+    model = UMAP(**kwargs)
     embedding = model.fit_transform(matrix)
 
     df = pd.DataFrame(embedding, columns=["UMAP_1", "UMAP_2"])
