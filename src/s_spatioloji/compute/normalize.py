@@ -186,6 +186,7 @@ def normalize_total(
     input_key: str = "expression",
     output_key: str = "X_norm",
     force: bool = True,
+    chunk_size: int = _CHUNK_CELLS,
 ) -> str:
     """Normalize each cell to a fixed total count.
 
@@ -198,12 +199,15 @@ def normalize_total(
         input_key: Key to read input from (``"expression"`` or a maps/ key).
         output_key: Key to write the result under.
         force: If ``False``, skip if output already exists.
+        chunk_size: Number of cells per processing chunk. Lower = less RAM.
 
     Returns:
         The *output_key* string.
 
     Example:
         >>> normalize_total(sj, target_sum=1e4)
+        'X_norm'
+        >>> normalize_total(sj, chunk_size=10_000)  # use less RAM
         'X_norm'
     """
     maps_dir = sj.config.root / "maps"
@@ -219,7 +223,7 @@ def normalize_total(
 
     out_store = _create_output_zarr(sj, output_key, n_cells, n_genes, gene_names, cell_ids)
 
-    for start, end, chunk in _iter_expression_chunks(sj, input_key):
+    for start, end, chunk in _iter_expression_chunks(sj, input_key, chunk_size=chunk_size):
         chunk = chunk.astype(np.float32)
         row_sums = chunk.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1
@@ -234,6 +238,7 @@ def log1p(
     input_key: str = "X_norm",
     output_key: str = "X_log1p",
     force: bool = True,
+    chunk_size: int = _CHUNK_CELLS,
 ) -> str:
     """Apply natural log(1 + x) transform element-wise.
 
@@ -244,6 +249,7 @@ def log1p(
         input_key: Key to read input from.
         output_key: Key to write the result under.
         force: If ``False``, skip if output already exists.
+        chunk_size: Number of cells per processing chunk. Lower = less RAM.
 
     Returns:
         The *output_key* string.
@@ -265,7 +271,7 @@ def log1p(
 
     out_store = _create_output_zarr(sj, output_key, n_cells, n_genes, gene_names, cell_ids)
 
-    for start, end, chunk in _iter_expression_chunks(sj, input_key):
+    for start, end, chunk in _iter_expression_chunks(sj, input_key, chunk_size=chunk_size):
         transformed = np.log1p(chunk.astype(np.float32))
         out_store.write_chunk(start, transformed)
 
@@ -280,6 +286,7 @@ def scale(
     max_value: float = 10.0,
     output_key: str = "X_scaled",
     force: bool = True,
+    chunk_size: int = _CHUNK_CELLS,
 ) -> str:
     """Zero-centre and unit-variance scale, optionally subset to HVGs.
 
@@ -298,6 +305,7 @@ def scale(
         max_value: Clip scaled values to ``[-max_value, max_value]``.
         output_key: Key to write the result under.
         force: If ``False``, skip if output already exists.
+        chunk_size: Number of cells per processing chunk. Lower = less RAM.
 
     Returns:
         The *output_key* string.
@@ -334,7 +342,7 @@ def scale(
     m2 = np.zeros(n_out_genes, dtype=np.float64)
     count = 0
 
-    for start, end, chunk in _iter_expression_chunks(sj, input_key):
+    for start, end, chunk in _iter_expression_chunks(sj, input_key, chunk_size=chunk_size):
         chunk = chunk.astype(np.float64)
         if gene_idx is not None:
             chunk = chunk[:, gene_idx]
@@ -356,7 +364,7 @@ def scale(
         chunks_list = []
         cell_id_chunks = []
         cell_offset = 0
-        for start, end, chunk in _iter_expression_chunks(sj, input_key):
+        for start, end, chunk in _iter_expression_chunks(sj, input_key, chunk_size=chunk_size):
             chunk = chunk.astype(np.float32)
             if gene_idx is not None:
                 chunk = chunk[:, gene_idx]
@@ -373,7 +381,7 @@ def scale(
     else:
         # Full matrix: write as Zarr
         out_store = _create_output_zarr(sj, output_key, n_cells, n_out_genes, out_gene_names, cell_ids)
-        for start, end, chunk in _iter_expression_chunks(sj, input_key):
+        for start, end, chunk in _iter_expression_chunks(sj, input_key, chunk_size=chunk_size):
             chunk = chunk.astype(np.float32)
             if gene_idx is not None:
                 chunk = chunk[:, gene_idx]
@@ -389,6 +397,7 @@ def pearson_residuals(
     input_key: str = "expression",
     output_key: str = "X_residuals",
     force: bool = True,
+    chunk_size: int = _CHUNK_CELLS,
 ) -> str:
     """Compute Pearson residuals for a negative-binomial model.
 
@@ -404,6 +413,7 @@ def pearson_residuals(
         input_key: Key to read raw counts from.
         output_key: Key to write the result under.
         force: If ``False``, skip if output already exists.
+        chunk_size: Number of cells per processing chunk. Lower = less RAM.
 
     Returns:
         The *output_key* string.
@@ -428,7 +438,7 @@ def pearson_residuals(
     cell_totals = np.zeros(n_cells, dtype=np.float64)
     total_sum = 0.0
 
-    for start, end, chunk in _iter_expression_chunks(sj, input_key):
+    for start, end, chunk in _iter_expression_chunks(sj, input_key, chunk_size=chunk_size):
         chunk = chunk.astype(np.float64)
         gene_sums += chunk.sum(axis=0)
         cell_totals[start:end] = chunk.sum(axis=1)
@@ -440,7 +450,7 @@ def pearson_residuals(
     # Pass 2: compute residuals chunk by chunk
     out_store = _create_output_zarr(sj, output_key, n_cells, n_genes, gene_names, cell_ids)
 
-    for start, end, chunk in _iter_expression_chunks(sj, input_key):
+    for start, end, chunk in _iter_expression_chunks(sj, input_key, chunk_size=chunk_size):
         chunk = chunk.astype(np.float64)
         n_i = cell_totals[start:end, np.newaxis]  # (chunk_size, 1)
         mu = n_i * p[np.newaxis, :]  # (chunk_size, n_genes)
